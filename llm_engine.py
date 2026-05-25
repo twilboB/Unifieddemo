@@ -442,12 +442,10 @@ def generate_narrative(source_data: dict, focus: str = None, _progress_ph=None) 
 
 def _resolve_data_context(user_prompt: str) -> dict:
     """
-    Parse client name + date range from the prompt, fetch real performance data.
-    Uses live DuckDB data when 'Use live data' is toggled on, otherwise mock data.
+    Parse client name + date range from the prompt, fetch real BigQuery performance data.
+    Always uses live BigQuery — no mock fallback.
     """
     import calendar as _cal, datetime as _dt
-
-    use_live = st.session_state.get("settings_use_live_data", False)
 
     pl = user_prompt.lower()
 
@@ -469,100 +467,51 @@ def _resolve_data_context(user_prompt: str) -> dict:
             break
 
     _year = _dt.date.today().year
-    # If asking about live data (2026) and no year mentioned, default to 2026
-    if use_live and "2025" not in pl:
-        _year = 2026
+    # Default to current year; if 2025 explicitly mentioned, use that
+    if "2025" in pl:
+        _year = 2025
     start_date = f"{_year}-{start_m:02d}-01"
     end_date   = f"{_year}-{end_m:02d}-{_cal.monthrange(_year, end_m)[1]}"
 
-    if use_live:
-        # ── Live path: query DuckDB ──────────────────────────────────────────
-        from excel_data_layer import get_clients, get_campaigns, assemble_pca_data as _assemble
-        from excel_data_layer import CLIENT_NAMES
+    # ── BigQuery path ─────────────────────────────────────────────────────────
+    from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data as _assemble
+    from data_layer import get_live_clients
 
-        all_clients = {v.lower(): k for k, v in CLIENT_NAMES.items()}
-        matched_cid = matched_name = None
-        for name_lower, cid in all_clients.items():
-            if name_lower in pl:
-                matched_cid  = cid
-                matched_name = CLIENT_NAMES[cid]
-                break
+    live_clients = get_live_clients()
+    matched_cid = matched_name = None
+    for cid, cdata in live_clients.items():
+        if cdata["name"].lower() in pl or cid.lower() in pl:
+            matched_cid  = cid
+            matched_name = cdata["name"]
+            break
 
-        if not matched_cid:
-            return {"resolved": False, "client_name": None,
-                    "date_range": f"{start_date} → {end_date}", "campaigns": []}
+    if not matched_cid:
+        return {"resolved": False, "client_name": None,
+                "date_range": f"{start_date} → {end_date}", "campaigns": []}
 
-        camps = get_campaigns(matched_cid, start_date, end_date)
-        # Skip the "All Campaigns" aggregate entry, take up to 3 real campaigns by spend
-        real_camps = [c for c in camps if c["campaign_id"] != "live_all_campaigns"][:3]
+    camps = get_campaigns_for_client(matched_cid, start_date, end_date)
+    real_camps = [c for c in camps if not c["campaign_id"].endswith("_all")][:3]
 
-        if not real_camps:
-            return {"resolved": False, "client_name": matched_name,
-                    "date_range": f"{start_date} → {end_date}", "campaigns": []}
+    if not real_camps:
+        return {"resolved": False, "client_name": matched_name,
+                "date_range": f"{start_date} → {end_date}", "campaigns": []}
 
-        assembled = []
-        for c in real_camps:
-            try:
-                data = _assemble(matched_cid, c["campaign_id"], start_date, end_date, "all")
-                data["_campaign_name"] = c["campaign_name"]
-                data["_date_range"]    = f"{start_date} → {end_date}"
-                assembled.append(data)
-            except Exception:
-                pass
+    assembled = []
+    for c in real_camps:
+        try:
+            data = _assemble(matched_cid, c["campaign_id"], start_date, end_date, "all")
+            data["_campaign_name"] = c["campaign_name"]
+            data["_date_range"]    = f"{start_date} → {end_date}"
+            assembled.append(data)
+        except Exception:
+            pass
 
-        return {
-            "resolved":    bool(assembled),
-            "client_name": matched_name,
-            "date_range":  f"{start_date} → {end_date}",
-            "campaigns":   assembled,
-        }
-
-    else:
-        # ── Mock path (original logic) ───────────────────────────────────────
-        from mock_data import MOCK_CLIENTS, assemble_pca_data as _assemble
-
-        matched_cid = matched_name = None
-        for cid, cdata in MOCK_CLIENTS.items():
-            if cdata["name"].lower() in pl:
-                matched_cid  = cid
-                matched_name = cdata["name"]
-                break
-
-        if not matched_cid:
-            return {"resolved": False, "client_name": None,
-                    "date_range": f"{start_date} → {end_date}", "campaigns": []}
-
-        all_camps = MOCK_CLIENTS[matched_cid]["campaigns"]
-        active = [(cid, cd) for cid, cd in all_camps.items()
-                  if cd["start"] <= end_date and cd["end"] >= start_date]
-        if not active:
-            return {"resolved": False, "client_name": matched_name,
-                    "date_range": f"{start_date} → {end_date}", "campaigns": []}
-
-        STOP = {"a", "the", "and", "or", "for", "in", "on", "of", "to"}
-        prompt_words = set(pl.split()) - STOP
-        named = [(cid, cd) for cid, cd in active
-                 if set(cd["name"].lower().split()) & prompt_words - STOP]
-        chosen = (named or active)[:3]
-
-        assembled = []
-        for cid, cd in chosen:
-            eff_start = max(start_date, cd["start"])
-            eff_end   = min(end_date,   cd["end"])
-            try:
-                data = _assemble(matched_cid, cid, eff_start, eff_end, "all")
-                data["_campaign_name"] = cd["name"]
-                data["_date_range"]    = f"{eff_start} → {eff_end}"
-                assembled.append(data)
-            except Exception:
-                pass
-
-        return {
-            "resolved":    bool(assembled),
-            "client_name": matched_name,
-            "date_range":  f"{start_date} → {end_date}",
-            "campaigns":   assembled,
-        }
+    return {
+        "resolved":    bool(assembled),
+        "client_name": matched_name,
+        "date_range":  f"{start_date} → {end_date}",
+        "campaigns":   assembled,
+    }
 
 
 def generate_quick_slides(user_prompt: str) -> dict:
@@ -598,10 +547,11 @@ def generate_quick_slides(user_prompt: str) -> dict:
                     "Pull specific CPM, CTR, CPC, impression, and spend figures directly from it."
                 )
             else:
-                from mock_data import MOCK_CLIENTS
-                data_section = json.dumps(MOCK_CLIENTS, default=str)
+                from data_layer import get_qa_context
+                _ctx_data = get_qa_context(user_prompt)
+                data_section = json.dumps(_ctx_data, default=str)
                 data_note = (
-                    "This is campaign-level metadata (platforms, objectives, monthly spend). "
+                    "This is live BigQuery portfolio data (spend by client/platform/objective). "
                     "Use it to estimate and reason about performance."
                 )
 
@@ -690,7 +640,7 @@ def answer_benchmark_question(query: str, chat_history: list = None, context_dat
     if provider == "Vertex AI (Gemini)":
         try:
             from google import genai
-            from mock_data import get_portfolio_overview, MOCK_CLIENTS
+            from live_analytics import get_portfolio_overview, get_portfolio_benchmarks
 
             client = _gemini_client()
             overview = get_portfolio_overview()
@@ -717,7 +667,6 @@ For CTR: positive variance vs pool = client has better engagement (good).
 Keep responses concise. Use bullet points.
 """
             else:
-                from mock_data import get_portfolio_benchmarks
                 benchmarks = get_portfolio_benchmarks("all")
                 context = f"""You are a senior media benchmarking analyst at a media agency.
 Portfolio benchmark data (our actuals vs industry standards):
@@ -725,9 +674,6 @@ Portfolio benchmark data (our actuals vs industry standards):
 
 Portfolio overview:
 {json.dumps(overview, default=str)}
-
-Client data:
-{json.dumps(MOCK_CLIENTS, default=str)}
 
 Answer with direct insight first, then data, then implication. Be concise.
 """
@@ -824,10 +770,7 @@ def answer_question_with_llm(query: str, chat_history: list = None) -> dict:
         except Exception as e:
             return {"answer": f"Sorry, I encountered an error: {e}", "query_explanation": "API Error", "cost": 0.0}
 
-    from mock_data import answer_question as fallback
-    res = fallback(query, "all")
-    res["cost"] = 0.0
-    return res
+    return {"answer": "LLM provider not configured. Enable Vertex AI in ⚙️ Settings.", "query_explanation": "", "cost": 0.0}
 
 def generate_optimizations(source_data: dict) -> dict:
     if not st.session_state.get("settings_llm_enabled", False):

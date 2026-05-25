@@ -253,7 +253,7 @@ hr { border: none !important; border-top: 1px solid var(--border) !important; ma
 
 from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data, get_portfolio_actuals
 from llm_engine import generate_narrative, answer_question_with_llm, generate_quick_slides, answer_benchmark_question, generate_media_strategy
-from mock_data import get_portfolio_overview, score_campaign, get_pacing_data
+from live_analytics import get_portfolio_overview, score_campaign, get_pacing_data
 from excel_builder import build_pca_workbook, build_media_strategy_excel
 from pptx_builder import build_pptx_from_template, build_quick_slides_pptx, build_media_strategy_pptx
 
@@ -1351,220 +1351,86 @@ elif mode == "🏆 Benchmarks":
 # MODE 6: DATA (SuperMetrics pull)
 # ═══════════════════════════════════════
 elif mode == "🗄️ Data":
-    try:
-        import local_db
-        from supermetrics_connector import PLATFORM_CONFIG, PLATFORM_TIERS
-    except ImportError as _e:
-        st.markdown("""<div class="main-header"><h1>🗄️ Data</h1><p>SuperMetrics connector</p></div>""", unsafe_allow_html=True)
-        st.error(f"Required module not installed: `{_e}`. This tab requires `local_db` and `supermetrics_connector`.")
-        st.stop()
-
     st.markdown("""<div class="main-header">
-        <h1>🗄️ Data</h1>
-        <p>Pull from SuperMetrics and store locally for the PCA Builder</p>
+        <h1>🗄️ BigQuery Data</h1>
+        <p>Live connection to <code>res-apac-dev-skynet-au · resodigital_MelbUnified.all_clients_unified</code></p>
     </div>""", unsafe_allow_html=True)
 
-    # ── Session state init ────────────────────────────────────────────────────
-    if "sm_api_key"     not in st.session_state: st.session_state.sm_api_key     = ""
-    if "sm_ds_user"     not in st.session_state: st.session_state.sm_ds_user     = ""
-    if "sm_connected"   not in st.session_state: st.session_state.sm_connected   = False
-    if "sm_pull_log"    not in st.session_state: st.session_state.sm_pull_log    = []
+    from bigquery_data_layer import get_bq_summary, _run, TABLE_ID
 
-    # ── DB summary banner ─────────────────────────────────────────────────────
-    summary = local_db.get_data_summary()
-    if summary:
-        sc1, sc2, sc3, sc4 = st.columns(4)
-        with sc1: st.metric("Rows", f"{summary['row_count']:,}")
-        with sc2: st.metric("Date Range", f"{summary['date_min']} → {summary['date_max']}")
-        with sc3: st.metric("Platforms", len(summary["platforms"]))
-        with sc4: st.metric("Total Spend", f"${summary['total_spend']:,.0f}")
-        with st.expander("Clients & Platforms in DB", expanded=False):
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                st.markdown("**Clients**")
-                for c in summary["clients"]: st.markdown(f"- {c}")
-            with cc2:
-                st.markdown("**Platforms**")
-                for p in summary["platforms"]: st.markdown(f"- {p}")
-        if st.button("🗑️ Clear all data", key="db_clear"):
-            local_db.clear_all()
-            st.success("Database cleared.")
-            st.rerun()
-        st.markdown("---")
+    with st.spinner("Fetching BigQuery summary…"):
+        try:
+            summary = get_bq_summary()
+        except Exception as _bq_err:
+            st.error(f"BigQuery connection error: {_bq_err}")
+            st.caption("Make sure ADC is configured: `gcloud auth application-default login`")
+            st.stop()
 
-    # ── Step 1: Credentials ───────────────────────────────────────────────────
-    st.markdown("#### Step 1 — SuperMetrics Credentials")
-    st.caption("Uses the SuperMetrics Enterprise HTTP API — no Python SDK needed.")
-    cred_c1, cred_c2 = st.columns([2, 3])
-    with cred_c1:
-        user_input = st.text_input(
-            "SuperMetrics login email", value=st.session_state.sm_ds_user,
-            placeholder="you@agency.com", key="sm_user_input",
-        )
-    with cred_c2:
-        api_key_input = st.text_input(
-            "API Key", value=st.session_state.sm_api_key,
-            type="password",
-            placeholder="api_xxxx… (copy from your SuperMetrics query URL)",
-            key="sm_key_input",
-        )
-    if user_input    != st.session_state.sm_ds_user:  st.session_state.sm_ds_user  = user_input;    st.session_state.sm_connected = False
-    if api_key_input != st.session_state.sm_api_key:  st.session_state.sm_api_key  = api_key_input; st.session_state.sm_connected = False
-
-    can_connect = bool(st.session_state.sm_api_key and st.session_state.sm_ds_user)
-    if st.button("🔌 Test Connection", key="sm_connect", disabled=not can_connect):
-        with st.spinner("Testing connection…"):
-            from supermetrics_connector import SupermetricsConnector
-            conn = SupermetricsConnector(st.session_state.sm_api_key, st.session_state.sm_ds_user)
-            ok, err = conn.test_connection()
-            if ok:
-                st.session_state.sm_connected = True
-                st.success("Connected successfully.")
-            else:
-                st.error(f"Connection failed: {err}")
-
-    if not st.session_state.sm_connected:
+    if not summary:
+        st.warning("No data found in BigQuery table.")
         st.stop()
 
-    st.markdown("---")
-
-    # ── Step 2: Date Range ───────────────────────────────────────────────────
-    st.markdown("#### Step 2 — Date Range")
-    dr_c1, dr_c2 = st.columns(2)
-    with dr_c1:
-        pull_start = st.date_input("From", value=date(2025, 1, 1), key="sm_start")
-    with dr_c2:
-        pull_end = st.date_input("To", value=date.today(), min_value=pull_start, key="sm_end")
-    pull_start_str = pull_start.strftime("%Y-%m-%d")
-    pull_end_str   = pull_end.strftime("%Y-%m-%d")
+    # ── KPI banner ─────────────────────────────────────────────────────────
+    bq1, bq2, bq3, bq4 = st.columns(4)
+    with bq1: st.metric("Total Rows", f"{summary['row_count']:,}")
+    with bq2: st.metric("Date Range", f"{summary['date_min']} → {summary['date_max']}")
+    with bq3: st.metric("Clients", summary['clients'])
+    with bq4: st.metric("Total Spend", f"${summary.get('total_spend', 0):,.0f}")
 
     st.markdown("---")
 
-    # ── Step 3: Platform selection ────────────────────────────────────────────
-    st.markdown("#### Step 3 — Select Platforms")
-    st.caption("All accounts connected to your SuperMetrics login will be pulled automatically.")
-
-    selected_platforms: list[str] = []
-
-    for tier, platforms in sorted(PLATFORM_TIERS.items()):
-        st.markdown(f"**Tier {tier}**")
-        tier_cols = st.columns(len(platforms))
-        for col, platform in zip(tier_cols, platforms):
-            cfg = PLATFORM_CONFIG[platform]
-            with col:
-                if st.checkbox(cfg["label"], key=f"sm_plat_{platform}"):
-                    selected_platforms.append(platform)
-
-    st.markdown("---")
-
-    # ── Step 4: Client filter ─────────────────────────────────────────────────
-    st.markdown("#### Step 4 — Client Filter")
-    st.caption(
-        "One client name per line. Rows where the advertiser/account name contains any of these "
-        "(case-insensitive) will be kept; everything else is discarded. Leave blank to keep all data."
-    )
-    default_clients = "Coles\nVic Gov\nMazda\nSimplot\nHaynes\nRACV"
-    client_filter_raw = st.text_area(
-        "Clients to include", value=default_clients,
-        height=150, key="sm_client_filter", label_visibility="collapsed",
-    )
-    client_filter_terms = [c.strip().lower() for c in client_filter_raw.splitlines() if c.strip()]
+    # ── Rows by client ──────────────────────────────────────────────────────
+    st.markdown("#### Rows & Spend by Client")
+    try:
+        df_clients = _run(f"""
+            SELECT client,
+                   COUNT(*)       AS row_count,
+                   SUM(spend)     AS total_spend,
+                   MIN(date)      AS date_min,
+                   MAX(date)      AS date_max,
+                   COUNT(DISTINCT platform) AS platforms
+            FROM {TABLE_ID}
+            GROUP BY client
+            ORDER BY total_spend DESC
+        """)
+        st.dataframe(df_clients.style.format({"total_spend": "${:,.0f}", "row_count": "{:,}"}),
+                     use_container_width=True)
+    except Exception as _e:
+        st.warning(f"Could not load client breakdown: {_e}")
 
     st.markdown("---")
 
-    # ── Pull button ───────────────────────────────────────────────────────────
-    can_pull = bool(selected_platforms)
-    if st.button("🚀 Pull Data", type="primary", disabled=not can_pull, use_container_width=True, key="sm_pull"):
-        from supermetrics_connector import SupermetricsConnector
-        import re
+    # ── Rows by platform ────────────────────────────────────────────────────
+    st.markdown("#### Rows & Spend by Platform")
+    try:
+        df_plat = _run(f"""
+            SELECT platform,
+                   COUNT(*)  AS row_count,
+                   SUM(spend) AS total_spend
+            FROM {TABLE_ID}
+            GROUP BY platform
+            ORDER BY total_spend DESC
+        """)
+        st.dataframe(df_plat.style.format({"total_spend": "${:,.0f}", "row_count": "{:,}"}),
+                     use_container_width=True)
+    except Exception as _e:
+        st.warning(f"Could not load platform breakdown: {_e}")
 
-        def _matches_client(name: str) -> bool:
-            if not client_filter_terms:
-                return True
-            n = str(name).lower()
-            return any(term in n for term in client_filter_terms)
+    st.markdown("---")
 
-        def _derive_client_name(account_name: str) -> str:
-            """Map SuperMetrics advertiser name → clean client name."""
-            an = str(account_name).lower()
-            for term in client_filter_terms:
-                if term in an:
-                    # Title-case the matched term as the canonical client name
-                    return term.title()
-            return account_name
-
-        prog_bar  = st.progress(0.0)
-        prog_text = st.empty()
-        log_area  = st.empty()
-        pull_log  = []
-        total     = len(selected_platforms)
-
-        sm_conn = SupermetricsConnector(st.session_state.sm_api_key, st.session_state.sm_ds_user)
-
-        for i, platform in enumerate(selected_platforms):
-            label = PLATFORM_CONFIG[platform]["label"]
-            prog_bar.progress(i / total)
-
-            # Incremental: if data exists, pull from (last date - 7 days) to catch restatements
-            from datetime import timedelta as _td
-            last_date = local_db.get_last_date(platform)
-            if last_date:
-                incremental_start = (pd.Timestamp(last_date) - _td(days=7)).strftime("%Y-%m-%d")
-                effective_start = incremental_start
-                mode_label = f"incremental from {incremental_start}"
-            else:
-                effective_start = pull_start_str
-                mode_label = f"full pull from {pull_start_str}"
-
-            prog_text.markdown(f"**Pulling {label}… ({i+1}/{total}) — {mode_label}**")
-
+    # ── Raw SQL explorer ────────────────────────────────────────────────────
+    st.markdown("#### SQL Explorer")
+    st.caption("Run any SELECT query against the unified table.")
+    default_sql = f"SELECT client, platform, date, spend, impressions\nFROM {TABLE_ID}\nORDER BY date DESC\nLIMIT 50"
+    user_sql = st.text_area("SQL", value=default_sql, height=120, key="bq_sql_input")
+    if st.button("▶ Run Query", key="bq_run"):
+        with st.spinner("Querying BigQuery…"):
             try:
-                df = sm_conn.pull_platform(
-                    platform=platform,
-                    start_date=effective_start,
-                    end_date=pull_end_str,
-                )
-                if df.empty:
-                    pull_log.append(f"⚠️ {label}: 0 rows returned")
-                else:
-                    raw_count = len(df)
-                    # Filter to target clients using account_name or campaign_name
-                    if client_filter_terms:
-                        name_col = next(
-                            (c for c in ["account_name", "client_name", "campaign_name"] if c in df.columns),
-                            None,
-                        )
-                        if name_col:
-                            mask = df[name_col].astype(str).str.lower().apply(_matches_client)
-                            df = df[mask].copy()
-                        if df.empty:
-                            pull_log.append(f"⚠️ {label}: {raw_count:,} rows pulled, 0 matched client filter")
-                            log_area.markdown("\n".join(pull_log))
-                            continue
-
-                    # Derive clean client_name + client_id from account_name
-                    if "account_name" in df.columns:
-                        df["client_name"] = df["account_name"].apply(_derive_client_name)
-                        df["client_id"]   = df["client_name"].str.lower().str.replace(r"\W+", "_", regex=True)
-
-                    local_db.upsert_data(df)
-                    filtered_note = f" ({raw_count:,} total → {len(df):,} after filter)" if client_filter_terms else ""
-                    pull_log.append(f"✅ {label}: {len(df):,} rows stored{filtered_note}")
-            except Exception as exc:
-                pull_log.append(f"❌ {label}: {exc}")
-
-            log_area.markdown("\n".join(pull_log))
-
-        prog_bar.progress(1.0)
-        prog_text.markdown("**Done.**")
-        st.session_state.sm_pull_log = pull_log
-        st.rerun()
-
-    # Show previous pull log
-    if st.session_state.sm_pull_log:
-        with st.expander("Last pull log", expanded=True):
-            for line in st.session_state.sm_pull_log:
-                st.markdown(line)
+                df_result = _run(user_sql)
+                st.success(f"{len(df_result):,} rows returned")
+                st.dataframe(df_result, use_container_width=True)
+            except Exception as _qe:
+                st.error(f"Query error: {_qe}")
 
 # ═══════════════════════════════════════
 # MODE 7: AUTOMATED OPTIMIZATION
@@ -1686,8 +1552,9 @@ elif mode == "🧠 Media Strategy Builder":
     from llm_engine import generate_media_strategy
     from excel_builder import build_media_strategy_excel
     from pptx_builder import build_media_strategy_pptx
-    from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data
-    from mock_data import MOCK_CLIENTS, get_portfolio_benchmarks
+    from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data, get_live_clients as _msb_glc
+    from live_analytics import get_portfolio_benchmarks
+    MOCK_CLIENTS = _msb_glc()
 
     st.markdown("""<div class="main-header">
         <h1>🧠 Media Strategy Builder</h1>
@@ -2423,7 +2290,6 @@ elif mode == "📊 Campaign Pulse":
 # ═══════════════════════════════════════
 elif mode == "⏱️ Pacerly":
     from data_layer import get_live_clients as _glc
-    import mock_data as _md_pac
     MOCK_CLIENTS = _glc()
 
     st.markdown("""<div class="main-header">
@@ -2448,18 +2314,7 @@ elif mode == "⏱️ Pacerly":
     if pac_gen or ("pac_result" in st.session_state and st.session_state.get("_pac_key") == _pac_key):
         if pac_gen or "pac_result" not in st.session_state:
             with st.spinner("Computing pacing…"):
-                # Temporarily patch mock_data for live clients, then restore
-                _orig_mc  = _md_pac.MOCK_CLIENTS
-                _orig_pca = _md_pac.assemble_pca_data
-                try:
-                    if st.session_state.get("settings_use_live_data", False):
-                        from excel_data_layer import assemble_pca_data as _xl_pca
-                        _md_pac.MOCK_CLIENTS      = MOCK_CLIENTS
-                        _md_pac.assemble_pca_data = _xl_pca
-                    pac_result = get_pacing_data(pac_ci, pac_camp, str(pac_sd), str(pac_ed))
-                finally:
-                    _md_pac.MOCK_CLIENTS      = _orig_mc
-                    _md_pac.assemble_pca_data = _orig_pca
+                pac_result = get_pacing_data(pac_ci, pac_camp, str(pac_sd), str(pac_ed))
             st.session_state["pac_result"] = pac_result
             st.session_state["_pac_key"]   = _pac_key
 
@@ -2570,7 +2425,8 @@ elif mode == "⏱️ Pacerly":
 # MODE: OPTIMIZER BUDDY
 # ═══════════════════════════════════════
 elif mode == "🤖 Optimizer Buddy":
-    from mock_data import MOCK_CLIENTS, assemble_pca_data
+    from data_layer import get_live_clients as _ob_glc, assemble_pca_data
+    MOCK_CLIENTS = _ob_glc()
     from llm_engine import generate_optimizations
 
     st.markdown("""<div class="main-header">
