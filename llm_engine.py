@@ -6,24 +6,18 @@ import os
 import time
 import streamlit as st
 
-# ── API key: env var takes priority, fallback to demo key ──────────────────────
-_GEMINI_API_KEY  = os.environ.get("GOOGLE_API_KEY", "AIzaSyBviCi2R70-HV0lpEtCIggrv5WRmMyItM8")
 _VERTEX_PROJECT  = "res-apac-dev-skynet-au"
 _VERTEX_LOCATION = "us-central1"
 _VERTEX_MODEL    = "gemini-2.5-pro"                  # confirmed available on res-apac-dev-skynet-au
 
 def _gemini_client():
-    """Return Vertex AI client (ADC) when enabled, otherwise Google AI Studio (API key)."""
+    """Return Vertex AI client using Application Default Credentials (gcloud ADC)."""
     from google import genai
-    if st.session_state.get("settings_use_vertex", False):
-        return genai.Client(vertexai=True, project=_VERTEX_PROJECT, location=_VERTEX_LOCATION)
-    return genai.Client(api_key=_GEMINI_API_KEY)
+    return genai.Client(vertexai=True, project=_VERTEX_PROJECT, location=_VERTEX_LOCATION)
 
 def _model_name():
-    """Return the active model name — Vertex Pro or the user-selected AI Studio model."""
-    if st.session_state.get("settings_use_vertex", False):
-        return _VERTEX_MODEL
-    return st.session_state.get("settings_llm_model", "gemini-3.1-pro-preview")
+    """Return the active model name."""
+    return _VERTEX_MODEL
 
 def _last_usage(metadata):
     """Return usage_metadata only when it has real token counts (not 0/None)."""
@@ -68,20 +62,15 @@ def _call_with_retry(call_fn, model_name: str, max_retries: int = 3):
 
 def calculate_gemini_cost(prompt_tokens: int, output_tokens: int, model_name: str) -> float:
     """
-    Calculates estimated cost based on Google AI Studio pricing (per 1M tokens).
+    Calculates estimated cost based on Vertex AI pricing (per 1M tokens).
 
     Sources (as at Apr 2026):
-      gemini-3.1-pro-preview    <=200K ctx  $2.00 in / $12.00 out
-                                 >200K ctx  $4.00 in / $18.00 out
-      gemini-3-flash-preview     all ctx    $0.50 in /  $3.00 out
-      gemini-3.1-flash-lite-preview         $0.25 in /  $1.50 out
-      gemini-2.5-pro-*          <=200K ctx  $1.25 in /  $10.00 out  (est.)
+      gemini-2.5-pro            <=200K ctx  $1.25 in /  $10.00 out
                                  >200K ctx  $2.50 in /  $15.00 out
+      gemini-2.5-flash           all ctx    $0.30 in /  $2.50 out
       gemini-2.0-flash                      $0.10 in /  $0.40 out
-      gemini-2.0-flash-lite                 $0.075 in / $0.30 out
       gemini-1.5-pro            <=128K ctx  $1.25 in /  $5.00 out
                                  >128K ctx  $2.50 in /  $10.00 out
-      gemini-1.5-flash                      $0.075 in / $0.30 out
     """
     name = model_name.lower()
     total_tokens = prompt_tokens + output_tokens

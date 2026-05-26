@@ -299,16 +299,10 @@ def _load_dashboard_data(client_id, camp_id, camp_start, camp_end, ch):
     return assemble_pca_data(client_id, camp_id, camp_start, camp_end, ch)
 
 # ═══════════════════════════════════════
-# SETTINGS (initialise defaults + hardcode API key)
+# SESSION STATE DEFAULTS
 # ═══════════════════════════════════════
 DEFAULT_SETTINGS = {
-    # Data is always live BigQuery — no toggle needed
     "settings_llm_enabled": True,
-    "settings_use_vertex": True,          # default: Vertex AI via gcloud ADC
-    "settings_llm_provider": "Vertex AI (Gemini)",
-    "settings_llm_model": "gemini-2.5-flash-preview-05-20",   # fallback for API key path
-    "settings_llm_project": "res-apac-dev-skynet-au",
-    "settings_llm_location": "us-central1",
     "settings_channel_filter": "All Channels (Online + Offline)"
 }
 
