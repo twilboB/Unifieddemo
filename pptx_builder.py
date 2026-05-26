@@ -1,6 +1,6 @@
 """
 Template-based PowerPoint generator for PCA Builder.
-Copies and modifies OMD template.pptx rather than building from scratch.
+Copies and modifies OMD Template.pptx rather than building from scratch.
 
 Template slide map (0-based):
   0 → Cover        (Cover 1 layout)
@@ -19,7 +19,7 @@ from pptx.dml.color import RGBColor
 from pptx.oxml.ns import qn
 from lxml import etree
 
-TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "OMD template.pptx")
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "OMD Template.pptx")
 
 # Template slide indices
 TMPL_COVER    = 0
@@ -712,7 +712,7 @@ def build_pptx_from_template(
     date_range: str = ""
 ) -> str:
     """
-    Build a branded PPTX from OMD template.pptx.
+    Build a branded PPTX from OMD Template.pptx.
 
     Deck order: Cover → Agenda → [Divider + data slides] × N → Rec → Callout
     """
