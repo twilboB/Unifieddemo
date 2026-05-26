@@ -647,9 +647,6 @@ elif mode == "📊 Build PCA":
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
 
-        if os.path.exists("assets/pca_architecture.png"):
-            with st.expander("ℹ️ How the PCA Generator works", expanded=False):
-                st.image("assets/pca_architecture.png", use_container_width=True)
         st.stop()
 
     _cache_key = (sci, sc["campaign_id"], ss, es, ch_val, focus or "")
@@ -1184,9 +1181,6 @@ elif mode == "⚡ Slide Generator":
                 st.markdown(f'<div class="kpi-card"><div class="kpi-label">{lbl}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        if os.path.exists("assets/slide_generator_architecture.png"):
-            with st.expander("ℹ️ How the Slide Generator works", expanded=False):
-                st.image("assets/slide_generator_architecture.png", use_container_width=True)
 
     if "sg_result" in st.session_state:
         sg_res    = st.session_state["sg_result"]
