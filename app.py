@@ -252,10 +252,9 @@ hr { border: none !important; border-top: 1px solid var(--border) !important; ma
 """, unsafe_allow_html=True)
 
 from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data, get_portfolio_actuals
-from llm_engine import generate_narrative, answer_question_with_llm, generate_quick_slides, answer_benchmark_question, generate_media_strategy
-from live_analytics import get_portfolio_overview, score_campaign, get_pacing_data
-from excel_builder import build_pca_workbook, build_media_strategy_excel
-from pptx_builder import build_pptx_from_template, build_quick_slides_pptx, build_media_strategy_pptx
+from llm_engine import generate_narrative, answer_question_with_llm, generate_quick_slides, answer_benchmark_question, generate_weekly_meet
+from excel_builder import build_pca_workbook
+from pptx_builder import build_pptx_from_template, build_quick_slides_pptx
 
 # ─── Module-level cached helpers (must be at module scope for st.cache_data to work) ──
 
@@ -305,9 +304,9 @@ def _load_dashboard_data(client_id, camp_id, camp_start, camp_end, ch):
 DEFAULT_SETTINGS = {
     # Data is always live BigQuery — no toggle needed
     "settings_llm_enabled": True,
-    "settings_use_vertex": False,
+    "settings_use_vertex": True,          # default: Vertex AI via gcloud ADC
     "settings_llm_provider": "Vertex AI (Gemini)",
-    "settings_llm_model": "gemini-3.1-pro-preview",
+    "settings_llm_model": "gemini-2.5-flash-preview-05-20",   # fallback for API key path
     "settings_llm_project": "res-apac-dev-skynet-au",
     "settings_llm_location": "us-central1",
     "settings_channel_filter": "All Channels (Online + Offline)"
@@ -337,106 +336,214 @@ with st.sidebar:
     st.markdown("##### 📈 Reporting & Benchmarks")
     nav_btn("📈 Dashboard")
     nav_btn("🏆 Benchmarks")
-    nav_btn("🗄️ Data")
+    nav_btn("📅 Weekly Meet")
 
     st.markdown("##### 📊 PCA & Insights")
     nav_btn("💬 Ask a Question")
     nav_btn("📊 Build PCA")
     nav_btn("⚡ Slide Generator")
 
-    st.markdown("##### 🤖 Agentic & Predictive")
-    nav_btn("⚡ Automated Optimization")
-    nav_btn("🧠 Media Strategy Builder")
-
-    st.markdown("##### 🎯 Performance Cohort")
-    nav_btn("📊 Campaign Pulse")
-    nav_btn("⏱️ Pacerly")
-    nav_btn("🤖 Optimizer Buddy")
-
-    st.markdown("##### 🏷️ Data Quality")
-    nav_btn("🏷️ Taxonomy Compliance")
-
     mode = st.session_state.app_mode
 
+    # Always use all channels; always use live LLM + Vertex
+    ch_val    = "all"
+    ch_filter = "All Channels"
+
     _data_status = "🟢 BigQuery"
-    _llm_status  = "🟢 Live LLM"  if st.session_state.settings_llm_enabled  else "🟡 Mock LLM"
+    _llm_status  = "🟢 Vertex AI"
     st.caption(f"{_data_status}  •  {_llm_status}")
-
-    st.markdown("---")
-    ch_filter = st.radio("📡 Channel Filter", ["All Channels (Online + Offline)", "Digital Only", "Offline Only (TV, Radio, OOH)"], index=["All Channels (Online + Offline)", "Digital Only", "Offline Only (TV, Radio, OOH)"].index(st.session_state.settings_channel_filter), key="ch_filter_radio")
-    st.session_state.settings_channel_filter = ch_filter
-    ch_map = {"All Channels (Online + Offline)": "all", "Digital Only": "digital", "Offline Only (TV, Radio, OOH)": "offline"}
-    ch_val = ch_map[ch_filter]
-
-    st.markdown("---")
-    with st.expander("⚙️ Settings", expanded=False):
-        st.markdown("##### LLM Connection")
-        st.session_state.settings_llm_enabled = st.toggle("Use live LLM", value=st.session_state.settings_llm_enabled)
-        if st.session_state.settings_llm_enabled:
-            st.session_state.settings_use_vertex = st.toggle(
-                "🏢 Use Corporate Vertex AI",
-                value=st.session_state.get("settings_use_vertex", False),
-                help="Uses gemini-2.5-pro via res-apac-dev-skynet-au (ADC). Off = personal API key."
-            )
-            if st.session_state.settings_use_vertex:
-                st.caption("🔒 **Vertex AI** · `gemini-2.5-pro` · `res-apac-dev-skynet-au`")
-            else:
-                st.session_state.settings_llm_model = st.selectbox("Model", [
-                    "gemini-3.1-pro-preview",
-                    "gemini-3-flash-preview",
-                    "gemini-2.5-pro-preview-03-25",
-                    "gemini-2.0-flash",
-                ], key="vertex_model_select")
-                st.caption("🔑 **Personal API key**")
-            st.session_state.settings_llm_project = st.text_input("GCP Project ID", value=st.session_state.get("settings_llm_project", "res-apac-dev-skynet-au"))
-        else:
-            st.caption("Using mock LLM (structured template responses)")
     st.markdown("---")
 
 # ═══════════════════════════════════════
 # MODE 1: CONVERSATION ENGINE
 # ═══════════════════════════════════════
 if mode == "💬 Ask a Question":
-    st.markdown("""<div class="main-header"><h1>💬 Ask the Data Spine</h1>
-    <p>Natural language queries across all clients and campaigns  •  """ + ch_filter + """</p></div>""", unsafe_allow_html=True)
 
-    with st.sidebar:
-        st.markdown("##### Try these:")
-        examples = ["How much was spent on Mazda in January?", "Telstra platform breakdown Q3", "Compare all clients for 2025"]
-        for ex in examples:
-            if st.button(ex, use_container_width=True, key=f"ex_{hash(ex)}"): st.session_state["chat_input"] = ex
+    # ── Extra CSS for chat ──────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    .qa-header { padding: 28px 0 8px; }
+    .qa-header h1 { font-size: 2rem; font-weight: 800; color: var(--navy); margin: 0; }
+    .qa-header p  { color: var(--text-2); margin: 4px 0 0; font-size: 0.92rem; }
 
+    .msg-wrap { display: flex; margin-bottom: 16px; align-items: flex-start; gap: 12px; }
+    .msg-wrap.user  { flex-direction: row-reverse; }
+    .msg-avatar {
+        width: 34px; height: 34px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 1rem; flex-shrink: 0; margin-top: 2px;
+    }
+    .msg-avatar.user-av  { background: var(--purple); color: #fff; }
+    .msg-avatar.ai-av    { background: var(--navy);   color: #fff; }
+    .msg-bubble {
+        max-width: 82%; padding: 14px 18px; border-radius: 16px;
+        font-size: 0.93rem; line-height: 1.65; word-break: break-word;
+    }
+    .msg-bubble.user-bub {
+        background: var(--purple); color: #fff;
+        border-bottom-right-radius: 4px;
+    }
+    .msg-bubble.ai-bub {
+        background: var(--surface); color: var(--text-1);
+        border: 1px solid var(--border); border-bottom-left-radius: 4px;
+        box-shadow: var(--sh-sm);
+    }
+    .msg-meta { font-size: 0.72rem; color: var(--text-3); margin-top: 5px; padding: 0 4px; }
+    .msg-meta.user-meta { text-align: right; }
+
+    .qa-input-row {
+        position: sticky; bottom: 0; background: var(--bg);
+        padding: 12px 0 4px; border-top: 1px solid var(--border-lt);
+        margin-top: 8px;
+    }
+    .suggestion-chip {
+        display: inline-block; padding: 5px 12px; margin: 4px;
+        background: var(--purple-bg); color: var(--purple);
+        border-radius: 20px; font-size: 0.8rem; cursor: pointer;
+        border: 1px solid #d4d0f5; font-weight: 500;
+        white-space: nowrap;
+    }
+    .data-badge {
+        display: inline-block; padding: 3px 10px;
+        background: var(--green-bg); color: var(--green);
+        border-radius: 12px; font-size: 0.72rem; font-weight: 600;
+        border: 1px solid #a7f3d0; margin-right: 6px;
+    }
+    .period-badge {
+        display: inline-block; padding: 3px 10px;
+        background: var(--orange-bg); color: var(--orange);
+        border-radius: 12px; font-size: 0.72rem; font-weight: 600;
+        border: 1px solid #fed7aa;
+    }
+    .empty-state {
+        text-align: center; padding: 60px 20px; color: var(--text-3);
+    }
+    .empty-state h3 { color: var(--text-2); font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; }
+    .chip-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; max-width: 640px; margin: 20px auto 0; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"""<div class="qa-header">
+        <h1>💬 Ask the Data Spine</h1>
+        <p>Live BigQuery · Natural language · All clients &amp; campaigns</p>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Session state ──────────────────────────────────────────────────────
     if "chat_history" not in st.session_state: st.session_state.chat_history = []
+    if "qa_pending"   not in st.session_state: st.session_state.qa_pending   = None
 
-    for msg in st.session_state.chat_history:
-        if msg["role"] == "user":
-            st.markdown(f'<div class="chat-msg chat-user">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="chat-msg chat-ai">{msg["content"]}</div>', unsafe_allow_html=True)
-            # FIX: Added cost to the chat explanation text
-            cost_text = f" | 💰 Est. Cost: ${msg.get('cost', 0.0):.4f}" if "cost" in msg else ""
-            if msg.get("qe"): st.caption(f"🔍 {msg['qe']}{cost_text}")
+    # ── Sidebar: dynamic suggestions ──────────────────────────────────────
+    with st.sidebar:
+        st.markdown("##### 💡 Try asking…")
+        # Pull actual client list for dynamic chips
+        try:
+            from bigquery_data_layer import _run, TABLE_ID as _TID
+            _cli_df = _run(f"SELECT DISTINCT client FROM {_TID} ORDER BY client LIMIT 10")
+            _clients = _cli_df["client"].dropna().tolist()
+        except Exception:
+            _clients = ["Mazda", "Simplot", "Coles"]
 
-    c1, c2 = st.columns([5, 1])
-    with c1:
-        dv = st.session_state.pop("chat_input", "")
-        ui = st.text_input("Ask...", value=dv, label_visibility="collapsed", placeholder="e.g. How much was spent on Mazda in January?", key="cbox")
-    with c2:
-        send = st.button("Send", type="primary", use_container_width=True)
+        _suggestions = []
+        if _clients:
+            c0 = _clients[0]
+            _suggestions += [
+                f"How much did {c0} spend last week?",
+                f"What was {c0}'s top platform this month?",
+                f"Break down {c0} spend by objective in Q1",
+            ]
+        if len(_clients) > 1:
+            _suggestions.append(f"Compare {_clients[0]} vs {_clients[1]} for 2025")
+        _suggestions += [
+            "Which client had the highest CPM last month?",
+            "Show me weekly spend trends for all clients",
+            "What platforms drove the most impressions this year?",
+            "Which campaigns are running right now?",
+        ]
 
-    if not st.session_state.chat_history:
-        with st.expander("ℹ️ How the Question Engine works", expanded=False):
-            st.image("assets/question_engine_architecture.png", use_container_width=True)
+        for sug in _suggestions[:8]:
+            if st.button(sug, use_container_width=True, key=f"sug_{hash(sug)}"):
+                st.session_state.qa_pending = sug
+                st.rerun()
 
-    if (send or dv) and ui:
-        with st.spinner("Analyzing data with Gemini..."):
-            r = answer_question_with_llm(ui, st.session_state.chat_history)
-            
-        st.session_state.chat_history.append({"role": "user", "content": ui})
-        st.session_state.chat_history.append({"role": "assistant", "content": r["answer"], "qe": r.get("query_explanation", ""), "cost": r.get("cost", 0.0)})
+        st.markdown("---")
+        if st.button("🗑️ Clear conversation", use_container_width=True):
+            st.session_state.chat_history = []
+            st.rerun()
+        st.caption(f"🟢 **BigQuery** · {len(_clients)} clients in dataset")
+
+    # ── Trigger from sidebar chip ──────────────────────────────────────────
+    if st.session_state.qa_pending:
+        pending = st.session_state.qa_pending
+        st.session_state.qa_pending = None
+        with st.spinner(f"Querying BigQuery for \"{pending}\"…"):
+            r = answer_question_with_llm(pending, st.session_state.chat_history)
+        st.session_state.chat_history.append({"role": "user",      "content": pending})
+        st.session_state.chat_history.append({"role": "assistant",  "content": r["answer"],
+                                               "qe": r.get("query_explanation",""),
+                                               "cost": r.get("cost", 0.0),
+                                               "period": r.get("period","")})
         st.rerun()
 
-    if st.sidebar.button("🗑️ Clear Chat", use_container_width=True): st.session_state.chat_history = []; st.rerun()
+    # ── Chat history — use st.chat_message for proper markdown rendering ──────
+    if not st.session_state.chat_history:
+        st.markdown(f"""<div class="empty-state">
+            <div style="font-size:2.5rem;margin-bottom:12px;">🗄️</div>
+            <h3>Ask anything about your media data</h3>
+            <p style="font-size:0.85rem;">Connected to live BigQuery · {len(_clients)} clients · Powered by gemini-2.5-pro via Vertex AI</p>
+            <p style="font-size:0.82rem;color:#94A3B8;">Use natural language dates: <em>last week</em>, <em>Q1 2025</em>, <em>January</em>, <em>this month</em></p>
+            <div class="chip-grid">
+        """, unsafe_allow_html=True)
+        _inline_chips = [
+            f"How much did {_clients[0]} spend last week?" if _clients else "Show total spend last week",
+            "Which platform had the lowest CPM this month?",
+            "Compare all clients for 2025",
+            "What was the weekly spend trend in Q1?",
+        ]
+        chips_html = "".join(f'<span class="suggestion-chip">{c}</span>' for c in _inline_chips)
+        st.markdown(chips_html + "</div></div>", unsafe_allow_html=True)
+    else:
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                with st.chat_message("user"):
+                    st.markdown(msg["content"])
+            else:
+                with st.chat_message("assistant"):
+                    st.markdown(msg["content"])
+                    # Meta row below the bubble
+                    cost_txt  = f"💰 ${msg.get('cost', 0):.4f}" if msg.get("cost") else ""
+                    model_txt = msg.get("qe", "")
+                    meta_parts = []
+                    meta_parts.append("🗄️ BigQuery · Vertex AI · gemini-2.5-pro")
+                    if model_txt and "gemini" in model_txt.lower():
+                        meta_parts.append(model_txt)
+                    if cost_txt:
+                        meta_parts.append(cost_txt)
+                    st.caption("  ·  ".join(meta_parts))
+
+    # ── Input bar ──────────────────────────────────────────────────────────
+    inp_col, btn_col = st.columns([6, 1])
+    with inp_col:
+        dv  = st.session_state.pop("chat_input", "")
+        ui  = st.chat_input(
+            "Ask anything… e.g. 'How much did Mazda spend last week?' or 'Compare platforms for Q1 2025'",
+        )
+    with btn_col:
+        pass  # chat_input handles its own submission
+
+    # Also handle sidebar chip clicks (set via qa_pending)
+    if ui:
+        with st.chat_message("user"):
+            st.markdown(ui)
+        with st.chat_message("assistant"):
+            with st.spinner("Querying BigQuery + Gemini…"):
+                r = answer_question_with_llm(ui, st.session_state.chat_history)
+            st.markdown(r["answer"])
+            cost_txt = f"💰 ${r.get('cost', 0):.4f}" if r.get("cost") else ""
+            st.caption(f"🗄️ BigQuery · Vertex AI · gemini-2.5-pro  ·  {cost_txt}")
+        st.session_state.chat_history.append({"role": "user",      "content": ui})
+        st.session_state.chat_history.append({"role": "assistant",  "content": r["answer"],
+                                               "qe": r.get("query_explanation", ""),
+                                               "cost": r.get("cost", 0.0)})
 
 # ═══════════════════════════════════════
 # MODE 2: PCA BUILDER
@@ -445,8 +552,8 @@ elif mode == "📊 Build PCA":
     with st.sidebar:
         st.markdown("##### 1. Date Range")
         c1, c2 = st.columns(2)
-        with c1: sd = st.date_input("Start", value=date(2026, 1, 1), min_value=date(2024, 1, 1))
-        with c2: ed = st.date_input("End", value=date(2026, 4, 14), min_value=sd)
+        with c1: sd = st.date_input("Start", value=date(2025, 7, 1), min_value=date(2025, 1, 1))
+        with c2: ed = st.date_input("End", value=date(2026, 5, 24), min_value=sd)
         ss, es = sd.strftime("%Y-%m-%d"), ed.strftime("%Y-%m-%d")
 
         st.markdown("##### 2. Client")
@@ -469,36 +576,59 @@ elif mode == "📊 Build PCA":
         gen = st.button("🚀 Generate PCA", type="primary", use_container_width=True)
 
     st.markdown(f"""<div class="main-header"><h1>📊 PCA Builder</h1>
-    <p>{scn}  •  {sc['campaign_name']}  •  {sc['start']} → {sc['end']}  •  {ch_filter}</p></div>""", unsafe_allow_html=True)
+    <p>{scn}  •  {sc['campaign_name']}  •  {sc['start']} → {sc['end']}</p></div>""", unsafe_allow_html=True)
 
     if not gen and "pca_result" not in st.session_state:
-        # ── Campaign preview ──────────────────────────────────────────────────
-        from data_layer import get_live_clients as _glc
-        _MC = _glc()
-        _camp_meta = _MC.get(sci, {}).get("campaigns", {}).get(sc["campaign_id"], {})
-        _start_dt  = date.fromisoformat(sc["start"])
-        _end_dt    = date.fromisoformat(sc["end"])
-        _months    = max((_end_dt.year - _start_dt.year) * 12 + (_end_dt.month - _start_dt.month), 1)
-        _est_spend = _camp_meta.get("monthly_spend", 0) * _months
-        _digital   = _camp_meta.get("platforms_digital", [])
-        _offline   = _camp_meta.get("platforms_offline", [])
-        _all_plats = _digital + _offline
+        # ── Campaign preview (live BQ) ────────────────────────────────────────
+        @st.cache_data(show_spinner=False, ttl=300)
+        def _pca_preview_bq(client_id, start, end):
+            from bigquery_data_layer import _run as _pr, TABLE_ID as _PT
+            try:
+                row = _pr(f"""
+                    SELECT SUM(spend) AS total_spend, SUM(impressions) AS impressions,
+                           SUM(clicks) AS clicks, COUNT(DISTINCT platform) AS n_platforms,
+                           MIN(date) AS date_min, MAX(date) AS date_max
+                    FROM {_PT}
+                    WHERE client = '{client_id}' AND date BETWEEN '{start}' AND '{end}'
+                      AND spend > 0
+                """).iloc[0]
+                plat_df = _pr(f"""
+                    SELECT ARRAY_AGG(DISTINCT platform IGNORE NULLS) AS plats
+                    FROM {_PT}
+                    WHERE client = '{client_id}' AND date BETWEEN '{start}' AND '{end}'
+                      AND spend > 0
+                """).iloc[0]
+                return {
+                    "spend":     float(row.total_spend or 0),
+                    "imps":      int(row.impressions or 0),
+                    "clicks":    int(row.clicks or 0),
+                    "n_platforms": int(row.n_platforms or 0),
+                    "date_min":  str(row.date_min)[:10] if row.date_min else start,
+                    "date_max":  str(row.date_max)[:10] if row.date_max else end,
+                    "platforms": list(plat_df.plats) if plat_df.plats else [],
+                }
+            except Exception:
+                return {}
 
-        _channel_map = {"meta":"Social","google_search":"Search","google_ads":"Search","dv360":"Programmatic",
-                        "youtube":"Video","tiktok":"Social","the_trade_desk":"Programmatic","ctv_bvod":"CTV/BVOD",
-                        "spotify":"Audio","bing_search":"Search","pinterest":"Social","linkedin":"Social",
-                        "snapchat":"Social","tv_seven":"TV","tv_nine":"TV","tv_ten":"TV","tv_sbs":"TV",
-                        "tv_foxtel":"TV","radio_sca":"Radio","radio_arn":"Radio","radio_nine_radio":"Radio",
-                        "radio_abc":"Radio","radio_nova":"Radio","ooh_large_format":"OOH","ooh_street_furniture":"OOH",
-                        "ooh_transit":"OOH","ooh_retail":"OOH","ooh_digital":"OOH"}
-        _channels   = sorted(set(_channel_map.get(p, "Digital") for p in _all_plats))
+        with st.spinner("Loading campaign preview…"):
+            _prev = _pca_preview_bq(sci, sc["start"], sc["end"])
+
+        _spend    = _prev.get("spend", 0)
+        _imps     = _prev.get("imps", 0)
+        _n_plats  = _prev.get("n_platforms", 0)
+        _plats    = _prev.get("platforms", [])
+        _cpm      = _spend / max(_imps, 1) * 1000
+
+        _start_dt = date.fromisoformat(sc["start"])
+        _end_dt   = date.fromisoformat(sc["end"])
+        _months   = max((_end_dt.year - _start_dt.year) * 12 + (_end_dt.month - _start_dt.month), 1)
 
         pr1, pr2, pr3, pr4 = st.columns(4)
         for col, (lbl, val, sub) in zip([pr1, pr2, pr3, pr4], [
-            ("Est. Campaign Spend", f"${_est_spend:,.0f}", f"{_months} month flight"),
-            ("Platforms",           str(len(_all_plats)),  f"{len(_digital)} digital · {len(_offline)} offline"),
-            ("Channels",            str(len(_channels)),   "  ·  ".join(_channels)),
-            ("Flight",              f"{sc['start']} → {sc['end']}", sc["campaign_name"]),
+            ("Total Spend",  f"${_spend:,.0f}",   f"{_months} month flight"),
+            ("Impressions",  f"{_imps:,.0f}",      f"CPM ${_cpm:.2f}"),
+            ("Platforms",    str(_n_plats),         f"{', '.join(_plats[:4])}{'…' if len(_plats) > 4 else ''}"),
+            ("Flight",       f"{sc['start']} → {sc['end']}", sc["campaign_name"][:40]),
         ]):
             with col:
                 st.markdown(f'<div class="kpi-card"><div class="kpi-label">{lbl}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
@@ -506,17 +636,20 @@ elif mode == "📊 Build PCA":
         st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
 
         # Platform chips
-        chip_html = " ".join(
-            f'<span style="display:inline-block;background:{"#EEF2FF" if p in _digital else "#FFF7ED"};'
-            f'color:{"#4F46E5" if p in _digital else "#C2410C"};font-size:11px;font-weight:600;'
-            f'padding:3px 10px;border-radius:12px;margin:2px;">{p.replace("_"," ").title()}</span>'
-            for p in _all_plats
-        )
-        st.markdown(chip_html, unsafe_allow_html=True)
+        if _plats:
+            chip_html = " ".join(
+                f'<span style="display:inline-block;background:#EEF2FF;color:#4F46E5;'
+                f'font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;margin:2px;">'
+                f'{p.replace("_"," ").title()}</span>'
+                for p in _plats
+            )
+            st.markdown(chip_html, unsafe_allow_html=True)
+
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
 
-        with st.expander("ℹ️ How the PCA Generator works", expanded=False):
-            st.image("assets/pca_architecture.png", use_container_width=True)
+        if os.path.exists("assets/pca_architecture.png"):
+            with st.expander("ℹ️ How the PCA Generator works", expanded=False):
+                st.image("assets/pca_architecture.png", use_container_width=True)
         st.stop()
 
     _cache_key = (sci, sc["campaign_id"], ss, es, ch_val, focus or "")
@@ -721,138 +854,261 @@ elif mode == "📊 Build PCA":
 # MODE 3: DASHBOARD
 # ═══════════════════════════════════════
 elif mode == "📈 Dashboard":
+    from bigquery_data_layer import _run as _bq_run, TABLE_ID as _TABLE_ID
 
-    METRIC_CONFIG = {
-        "Spend ($)":        {"ov_key": "total_spend",           "wk_key": "spend",       "fmt": "${:,.0f}"},
-        "Impressions":      {"ov_key": "total_impressions",     "wk_key": "impressions", "fmt": "{:,.0f}"},
-        "Clicks":           {"ov_key": "total_clicks",          "wk_key": None,          "fmt": "{:,.0f}"},
-        "CPM ($)":          {"ov_key": "cpm",                   "wk_key": "cpm",         "fmt": "${:.2f}"},
-        "CPC ($)":          {"ov_key": "cpc",                   "wk_key": None,          "fmt": "${:.2f}"},
-        "Completed Views":  {"ov_key": "total_completed_views", "wk_key": None,          "fmt": "{:,.0f}"},
-    }
+    @st.cache_data(show_spinner="Loading dashboard…", ttl=300)
+    def _dash_load(client_id, start, end):
+        """Load all dashboard data for a client + date range."""
+        base = f"FROM {_TABLE_ID} WHERE client = '{client_id}' AND date BETWEEN '{start}' AND '{end}'"
 
+        # KPI totals
+        kpi = _bq_run(f"""
+            SELECT SUM(spend) AS spend, SUM(impressions) AS imps,
+                   SUM(clicks) AS clicks, SUM(video_completions) AS vcr,
+                   SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm,
+                   SAFE_DIVIDE(SUM(clicks), SUM(impressions)) * 100 AS ctr,
+                   SAFE_DIVIDE(SUM(spend), SUM(clicks)) AS cpc,
+                   SAFE_DIVIDE(SUM(spend), SUM(video_completions)) AS cpcv
+            {base}
+        """).iloc[0].to_dict()
+
+        def breakdown(field, label):
+            try:
+                df = _bq_run(f"""
+                    SELECT {field} AS dim,
+                           SUM(spend) AS spend, SUM(impressions) AS imps,
+                           SUM(clicks) AS clicks, SUM(video_completions) AS vcr,
+                           SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm,
+                           SAFE_DIVIDE(SUM(clicks), SUM(impressions)) * 100 AS ctr,
+                           SAFE_DIVIDE(SUM(spend), SUM(clicks)) AS cpc
+                    {base}
+                    AND {field} IS NOT NULL AND TRIM({field}) != ''
+                    GROUP BY {field} ORDER BY spend DESC LIMIT 30
+                """)
+                df = df.rename(columns={"dim": label})
+                df["spend"] = df["spend"].astype(float)
+                df["Spend %"] = (df["spend"] / df["spend"].sum() * 100).round(1)
+                return df
+            except Exception:
+                return pd.DataFrame()
+
+        # Weekly trend
+        try:
+            weekly = _bq_run(f"""
+                SELECT DATE_TRUNC(date, WEEK(MONDAY)) AS week,
+                       SUM(spend) AS spend, SUM(impressions) AS imps,
+                       SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm
+                {base}
+                GROUP BY week ORDER BY week
+            """)
+        except Exception:
+            weekly = pd.DataFrame()
+
+        # Monthly trend
+        try:
+            monthly = _bq_run(f"""
+                SELECT FORMAT_DATE('%Y-%m', date) AS month,
+                       SUM(spend) AS spend, SUM(impressions) AS imps,
+                       SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm
+                {base}
+                GROUP BY month ORDER BY month
+            """)
+        except Exception:
+            monthly = pd.DataFrame()
+
+        return {
+            "kpi": kpi,
+            "by_platform": breakdown("platform", "Platform"),
+            "by_objective": breakdown("objective", "Objective"),
+            "by_format": breakdown("format", "Format"),
+            "by_publisher": breakdown("publisher_name", "Publisher"),
+            "by_geo": breakdown("geo_target", "Geo"),
+            "weekly": weekly,
+            "monthly": monthly,
+        }
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("##### 1. Date Range")
+        st.markdown("##### 📅 Date Range")
         dc1, dc2 = st.columns(2)
-        with dc1: dsd = st.date_input("Start", value=date(2026, 1, 1), min_value=date(2024, 1, 1), key="dash_sd")
-        with dc2: ded = st.date_input("End", value=date(2026, 4, 14), min_value=dsd, key="dash_ed")
+        with dc1: dsd = st.date_input("Start", value=date(2025, 7, 1), min_value=date(2025, 1, 1), key="dash_sd")
+        with dc2: ded = st.date_input("End", value=date(2026, 5, 24), min_value=dsd, key="dash_ed")
         dss, des = dsd.strftime("%Y-%m-%d"), ded.strftime("%Y-%m-%d")
 
-        st.markdown("##### 2. Client")
+        st.markdown("##### 👤 Client")
         d_clients = get_clients_in_date_range(dss, des)
         d_co = {c["client_name"]: c["client_id"] for c in d_clients}
-        if not d_co: st.warning("No clients in range."); st.stop()
-        d_cn = st.selectbox("Client", list(d_co.keys()), label_visibility="collapsed", key="dash_client")
+        if not d_co:
+            st.warning("No clients in range.")
+            st.stop()
+        _dash_prefill = st.session_state.pop("dash_prefill_client", None)
+        _dash_client_list = list(d_co.keys())
+        _dash_default_idx = _dash_client_list.index(_dash_prefill) if _dash_prefill and _dash_prefill in _dash_client_list else 0
+        d_cn = st.selectbox("Client", _dash_client_list, index=_dash_default_idx, label_visibility="collapsed", key="dash_client")
         d_ci = d_co[d_cn]
 
-        st.markdown("##### 3. Campaign")
-        d_camps = get_campaigns_for_client(d_ci, dss, des)
-        d_cop = {f"{c['campaign_name']}  ({c['start']} → {c['end']})": c for c in d_camps}
-        if not d_cop: st.warning("No campaigns."); st.stop()
-        d_scl = st.selectbox("Campaign", list(d_cop.keys()), label_visibility="collapsed", key="dash_camp")
-        d_sc = d_cop[d_scl]
-
-        st.markdown("##### 4. Metric")
-        d_metric = st.selectbox("View metric", list(METRIC_CONFIG.keys()), label_visibility="collapsed", key="dash_metric")
-
-    mcfg = METRIC_CONFIG[d_metric]
-
+        st.markdown("---")
+        if st.button("🏆 View in Benchmarks", use_container_width=True, key="dash_to_bench"):
+            st.session_state.app_mode = "🏆 Benchmarks"
+            st.session_state.bench_prefill_client = d_cn
+            st.rerun()
+    # ── Header ───────────────────────────────────────────────────────────────
     st.markdown(f"""<div class="main-header">
-        <h1>📈 Dashboard</h1>
-        <p>{d_cn}  •  {d_sc['campaign_name']}  •  {d_sc['start']} → {d_sc['end']}  •  {ch_filter}</p>
+        <h1>📈 Performance Dashboard</h1>
+        <p>{d_cn}  •  {dss} → {des}</p>
     </div>""", unsafe_allow_html=True)
 
-    with st.spinner("Loading…"):
-        d_data = _load_dashboard_data(d_ci, d_sc["campaign_id"], d_sc["start"], d_sc["end"], ch_val)
+    with st.spinner("Pulling live data…"):
+        dash = _dash_load(d_ci, dss, des)
 
-    d_ov = d_data["overview"]
-    d_ts  = sum(o["total_spend"] for o in d_ov)
-    d_ti  = sum(o["total_impressions"] for o in d_ov)
-    d_tc  = sum(o["total_clicks"] for o in d_ov)
-    d_tcv = sum(o.get("total_completed_views", 0) for o in d_ov)
-    d_cpm = d_ts / max(d_ti, 1) * 1000
-    d_cpc = d_ts / max(d_tc, 1) if d_tc else 0
+    kpi = dash["kpi"]
+    spend = float(kpi.get("spend") or 0)
+    imps  = float(kpi.get("imps") or 0)
+    clicks = float(kpi.get("clicks") or 0)
+    vcr   = float(kpi.get("vcr") or 0)
+    cpm   = float(kpi.get("cpm") or 0)
+    ctr   = float(kpi.get("ctr") or 0)
+    cpc   = float(kpi.get("cpc") or 0)
 
-    # ── KPI row ──
-    km1, km2, km3, km4, km5 = st.columns(5)
-    with km1: st.metric("Total Spend",    f"${d_ts:,.0f}")
-    with km2: st.metric("Impressions",    f"{d_ti:,.0f}")
-    with km3: st.metric("Avg CPM",        f"${d_cpm:.2f}")
-    with km4: st.metric("Clicks",         f"{d_tc:,.0f}")
-    with km5: st.metric("Avg CPC",        f"${d_cpc:.2f}" if d_cpc else "N/A")
+    # ── KPI row ──────────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    with k1: st.metric("💰 Total Spend",    f"${spend:,.0f}")
+    with k2: st.metric("👁️ Impressions",     f"{imps:,.0f}")
+    with k3: st.metric("🖱️ Clicks",          f"{clicks:,.0f}")
+    with k4: st.metric("📺 Completed Views", f"{vcr:,.0f}")
+    with k5: st.metric("📊 Avg CPM",         f"${cpm:.2f}")
+    with k6: st.metric("📈 CTR",             f"{ctr:.3f}%" if ctr else "N/A")
 
     st.markdown("---")
 
-    # ── Charts row ──
-    ch1, ch2 = st.columns([3, 2])
+    # ── Trend charts ─────────────────────────────────────────────────────────
+    import plotly.express as px
+    import plotly.graph_objects as go
 
-    with ch1:
-        st.markdown(f"**{d_metric} by Platform**")
-        plat_rows = [
-            {"Platform": o["platform"].replace("_", " ").title(),
-             d_metric: o.get(mcfg["ov_key"]) or 0}
-            for o in d_ov
-            if o.get(mcfg["ov_key"]) not in (None, "", 0)
-        ]
-        if plat_rows:
-            plat_df = pd.DataFrame(plat_rows).sort_values(d_metric, ascending=False).set_index("Platform")
-            st.bar_chart(plat_df)
+    trend_tab, breakdown_tabs_container = st.columns([2, 3])
+
+    with trend_tab:
+        st.markdown("##### 📅 Spend Trend")
+        monthly_df = dash["monthly"]
+        if not monthly_df.empty:
+            fig_trend = px.bar(
+                monthly_df, x="month", y="spend",
+                color_discrete_sequence=["#4338CA"],
+                labels={"month": "", "spend": "Spend ($)"},
+            )
+            fig_trend.update_layout(
+                height=220, margin=dict(l=0, r=0, t=10, b=0),
+                plot_bgcolor="white", paper_bgcolor="white",
+                yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
         else:
-            st.info(f"No {d_metric} data available.")
+            st.info("No monthly data.")
 
-    with ch2:
-        wk_key = mcfg["wk_key"]
-        if wk_key and d_data.get("weekly_trends"):
-            st.markdown(f"**{d_metric} — Weekly Trend**")
-            wk_agg = {}
-            for row in d_data["weekly_trends"]:
-                wk = row.get("week_start", "")
-                val = row.get(wk_key, 0) or 0
-                wk_agg[wk] = wk_agg.get(wk, 0) + val
-            wk_df = pd.DataFrame(sorted(wk_agg.items()), columns=["Week", d_metric]).set_index("Week")
-            st.line_chart(wk_df)
+    with breakdown_tabs_container:
+        st.markdown("##### 🏢 Spend by Platform")
+        plat_df = dash["by_platform"]
+        if not plat_df.empty:
+            fig_plat = px.bar(
+                plat_df.head(10), x="spend", y="Platform", orientation="h",
+                color="cpm", color_continuous_scale="Blues",
+                labels={"spend": "Spend ($)", "cpm": "CPM ($)"},
+                hover_data=["cpm", "ctr", "Spend %"],
+            )
+            fig_plat.update_layout(
+                height=220, margin=dict(l=0, r=0, t=10, b=0),
+                plot_bgcolor="white", paper_bgcolor="white",
+                xaxis_tickprefix="$", xaxis_tickformat=",.0f",
+                yaxis=dict(autorange="reversed"), showlegend=False,
+                coloraxis_showscale=False,
+            )
+            st.plotly_chart(fig_plat, use_container_width=True)
         else:
-            st.info(f"Weekly trend not available for {d_metric}.")
+            st.info("No platform data.")
 
     st.markdown("---")
 
-    # ── Full platform table ──
-    st.markdown("**Platform Detail**")
-    tbl_keys   = ["platform", "total_spend", "total_impressions", "total_clicks", "total_completed_views", "cpm", "cpc", "cpcv"]
-    tbl_labels = ["Platform",  "Spend ($)",   "Impressions",       "Clicks",       "Completed Views",        "CPM ($)", "CPC ($)", "CPCV ($)"]
-    tbl_df = pd.DataFrame([{k: o.get(k, "") for k in tbl_keys} for o in d_ov])
-    tbl_df["platform"] = tbl_df["platform"].str.replace("_", " ").str.title()
-    tbl_df.columns = tbl_labels
-    tbl_col_cfg = {
-        "Spend ($)":       st.column_config.NumberColumn(format="$%,.0f"),
-        "Impressions":     st.column_config.NumberColumn(format="%,.0f"),
-        "Clicks":          st.column_config.NumberColumn(format="%,.0f"),
-        "Completed Views": st.column_config.NumberColumn(format="%,.0f"),
-        "CPM ($)":         st.column_config.NumberColumn(format="$%.2f"),
-        "CPC ($)":         st.column_config.NumberColumn(format="$%.2f"),
-        "CPCV ($)":        st.column_config.NumberColumn(format="$%.2f"),
-    }
-    st.dataframe(tbl_df, use_container_width=True, hide_index=True, column_config=tbl_col_cfg)
+    # ── Taxonomy tabs ─────────────────────────────────────────────────────────
+    st.markdown("##### 🏷️ Taxonomy Breakdown")
+    TAX_TABS = [
+        ("🎯 Objective",   "by_objective",  "Objective"),
+        ("📐 Format",      "by_format",     "Format"),
+        ("🌐 Publisher",   "by_publisher",  "Publisher"),
+        ("📍 Geography",   "by_geo",        "Geo"),
+        ("📺 Platform",    "by_platform",   "Platform"),
+    ]
+    tab_objs = st.tabs([t[0] for t in TAX_TABS])
 
-    # ── Breakdowns ──
-    st.markdown("---")
-    bd_tabs = st.tabs([dim.replace("by_", "").replace("_", " ").title() for dim in d_data["breakdowns"]])
-    for tab, (dim, bdata) in zip(bd_tabs, d_data["breakdowns"].items()):
+    for tab, (tab_label, data_key, dim_col) in zip(tab_objs, TAX_TABS):
         with tab:
-            bd_df = pd.DataFrame(bdata)
-            if not bd_df.empty:
-                # bar chart on spend if present
-                if "spend" in bd_df.columns and "value" in bd_df.columns:
-                    st.bar_chart(bd_df.set_index("value")["spend"].sort_values(ascending=False))
-                st.dataframe(bd_df, use_container_width=True, hide_index=True)
+            df_tax = dash[data_key]
+            if df_tax.empty:
+                st.info(f"No {tab_label.split(' ', 1)[1]} data for this period.")
+                continue
 
-    # ── Benchmarks ──
-    if d_data.get("benchmarks"):
-        st.markdown("---")
-        st.markdown("**Benchmarks**")
-        bm_df = pd.DataFrame(d_data["benchmarks"])
-        bm_df["platform"] = bm_df["platform"].str.replace("_", " ").str.title()
-        st.dataframe(bm_df, use_container_width=True, hide_index=True)
+            # Format columns
+            df_show = df_tax[[dim_col, "spend", "Spend %", "imps", "cpm", "ctr", "cpc"]].copy()
+            df_show.columns = [dim_col, "Spend ($)", "Spend %", "Impressions", "CPM ($)", "CTR (%)", "CPC ($)"]
+            df_show["Spend ($)"]   = df_show["Spend ($)"].round(0)
+            df_show["CPM ($)"]     = df_show["CPM ($)"].round(2)
+            df_show["CTR (%)"]     = df_show["CTR (%)"].apply(lambda x: round(x, 3) if x else None)
+            df_show["CPC ($)"]     = df_show["CPC ($)"].apply(lambda x: round(x, 2) if x else None)
+            df_show["Impressions"] = df_show["Impressions"].astype("Int64")
+
+            col_a, col_b = st.columns([2, 3])
+            with col_a:
+                fig = px.pie(
+                    df_tax.head(8), values="spend", names=dim_col,
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                    hole=0.4,
+                )
+                fig.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=0),
+                                  showlegend=True, legend=dict(font=dict(size=11)))
+                fig.update_traces(textposition="inside", textinfo="percent")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_b:
+                st.dataframe(
+                    df_show,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=280,
+                    column_config={
+                        "Spend ($)":   st.column_config.NumberColumn(format="$%,.0f"),
+                        "Spend %":     st.column_config.ProgressColumn("Spend %", min_value=0, max_value=100, format="%.1f%%"),
+                        "Impressions": st.column_config.NumberColumn(format="%,.0f"),
+                        "CPM ($)":     st.column_config.NumberColumn(format="$%.2f"),
+                        "CTR (%)":     st.column_config.NumberColumn(format="%.3f"),
+                        "CPC ($)":     st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
+
+    # ── Platform detail table ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("##### 📊 Platform Performance Detail")
+    plat_detail = dash["by_platform"]
+    if not plat_detail.empty:
+        pd_show = plat_detail[["Platform", "spend", "Spend %", "imps", "cpm", "ctr", "cpc", "vcr"]].copy()
+        pd_show.columns = ["Platform", "Spend ($)", "Spend %", "Impressions", "CPM ($)", "CTR (%)", "CPC ($)", "Completed Views"]
+        pd_show["Spend ($)"]      = pd_show["Spend ($)"].round(0)
+        pd_show["CPM ($)"]        = pd_show["CPM ($)"].round(2)
+        pd_show["CTR (%)"]        = pd_show["CTR (%)"].apply(lambda x: round(x, 3) if x else None)
+        pd_show["CPC ($)"]        = pd_show["CPC ($)"].apply(lambda x: round(x, 2) if x else None)
+        pd_show["Impressions"]    = pd_show["Impressions"].astype("Int64")
+        pd_show["Completed Views"]= pd_show["Completed Views"].astype("Int64")
+        st.dataframe(
+            pd_show, use_container_width=True, hide_index=True,
+            column_config={
+                "Spend ($)":       st.column_config.NumberColumn(format="$%,.0f"),
+                "Spend %":         st.column_config.ProgressColumn("Spend %", min_value=0, max_value=100, format="%.1f%%"),
+                "Impressions":     st.column_config.NumberColumn(format="%,.0f"),
+                "Completed Views": st.column_config.NumberColumn(format="%,.0f"),
+                "CPM ($)":         st.column_config.NumberColumn(format="$%.2f"),
+                "CTR (%)":         st.column_config.NumberColumn(format="%.3f"),
+                "CPC ($)":         st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
 
 # ═══════════════════════════════════════
 # MODE 4: SLIDE GENERATOR
@@ -863,10 +1119,10 @@ elif mode == "⚡ Slide Generator":
         st.markdown("##### Try these:")
         sg_examples = [
             "3 slides on Meta performance for Coles",
-            "Telstra spend by platform for Q1 2025",
-            "5 slides on Qantas campaign efficiency",
-            "Weekly trend slides for Mazda CX-60",
-            "Creative format breakdown for any client",
+            "5 slides on Mazda campaign efficiency",
+            "RACV spend by platform for Q3 2025",
+            "Weekly trend slides for Simplot",
+            "Creative format breakdown for Hanes",
         ]
         for ex in sg_examples:
             if st.button(ex, use_container_width=True, key=f"sg_{hash(ex)}"):
@@ -882,7 +1138,7 @@ elif mode == "⚡ Slide Generator":
     with sg_c1:
         sg_input = st.text_input(
             "What slides do you want?", value=sg_dv,
-            placeholder='e.g. "3 slides on Telstra performance in January"',
+            placeholder='e.g. "3 slides on Coles performance in Q3 2025"',
             label_visibility="collapsed", key="sg_input"
         )
     with sg_c2:
@@ -895,27 +1151,42 @@ elif mode == "⚡ Slide Generator":
         st.session_state["sg_query"]  = sg_input
 
     if "sg_result" not in st.session_state:
-        from data_layer import get_live_clients as _glc
-        _MC = _glc()
-        _total_spend   = sum(c["monthly_spend"] * 12 for cl in _MC.values() for c in cl["campaigns"].values())
-        _total_camps   = sum(len(cl["campaigns"]) for cl in _MC.values())
-        _total_clients = len(_MC)
-        _all_plats     = set(p for cl in _MC.values() for c in cl["campaigns"].values()
-                             for p in c.get("platforms_digital", []) + c.get("platforms_offline", []))
+        @st.cache_data(show_spinner=False, ttl=600)
+        def _sg_bq_stats():
+            from bigquery_data_layer import _run as _sr, TABLE_ID as _ST
+            try:
+                row = _sr(f"""
+                    SELECT COUNT(DISTINCT client) AS clients,
+                           COUNT(DISTINCT platform) AS platforms,
+                           SUM(spend) AS total_spend,
+                           COUNT(DISTINCT COALESCE(NULLIF(TRIM(campaign_description),''), campaign_name)) AS campaigns
+                    FROM {_ST} WHERE spend > 0
+                """).iloc[0]
+                return {
+                    "clients":   int(row.clients or 0),
+                    "platforms": int(row.platforms or 0),
+                    "spend":     float(row.total_spend or 0),
+                    "campaigns": int(row.campaigns or 0),
+                }
+            except Exception:
+                return {"clients": 5, "platforms": 12, "spend": 0, "campaigns": 0}
+
+        _sg_stats = _sg_bq_stats()
 
         sg1, sg2, sg3, sg4 = st.columns(4)
         for col, (lbl, val, sub) in zip([sg1, sg2, sg3, sg4], [
-            ("Clients Available",   str(_total_clients),       "across all accounts"),
-            ("Campaigns",           str(_total_camps),         "in mock dataset"),
-            ("Total Portfolio Spend", f"${_total_spend/1e6:.1f}M", "annualised mock data"),
-            ("Platforms Tracked",   str(len(_all_plats)),      "digital + offline"),
+            ("Clients",           str(_sg_stats["clients"]),                    "Coles, Mazda, RACV, Simplot, Hanes"),
+            ("Campaigns",         str(_sg_stats["campaigns"]),                  "across all clients"),
+            ("Total Spend",       f"${_sg_stats['spend']/1e6:.1f}M",           "live from BigQuery"),
+            ("Platforms Tracked", str(_sg_stats["platforms"]),                  "Meta, DV360, TikTok + more"),
         ]):
             with col:
                 st.markdown(f'<div class="kpi-card"><div class="kpi-label">{lbl}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        with st.expander("ℹ️ How the Slide Generator works", expanded=False):
-            st.image("assets/slide_generator_architecture.png", use_container_width=True)
+        if os.path.exists("assets/slide_generator_architecture.png"):
+            with st.expander("ℹ️ How the Slide Generator works", expanded=False):
+                st.image("assets/slide_generator_architecture.png", use_container_width=True)
 
     if "sg_result" in st.session_state:
         sg_res    = st.session_state["sg_result"]
@@ -933,7 +1204,7 @@ elif mode == "⚡ Slide Generator":
         elif sg_ctx.get("client_name"):
             st.warning(f"⚠️ Matched **{sg_ctx['client_name']}** but no campaigns found in {sg_ctx.get('date_range','that period')}. Using campaign metadata only.")
         else:
-            st.info("ℹ️ No specific client detected in prompt — using full dataset. Try including a client name (e.g. 'Telstra', 'Coles') for richer data.")
+            st.info("ℹ️ No specific client detected — using full dataset. Try including a client name (e.g. 'Coles', 'Mazda', 'RACV') for richer data.")
 
         hcol1, hcol2 = st.columns([4, 1])
         with hcol1:
@@ -978,1879 +1249,965 @@ elif mode == "⚡ Slide Generator":
 # MODE 5: BENCHMARKS
 # ═══════════════════════════════════════
 elif mode == "🏆 Benchmarks":
+    import plotly.express as _bpx
+    import plotly.graph_objects as _bgo
+    from datetime import timedelta as _td
+    from bigquery_data_layer import _run as _bq, TABLE_ID as _BT
 
-    from collections import defaultdict as _dd
-    from data_layer import get_live_clients as _glc
-    _MC = _glc()
+    # ── helpers ───────────────────────────────────────────────────────────────
+    @st.cache_data(show_spinner=False, ttl=300)
+    def _bm_plat(client, start, end):
+        """Per-platform metrics for one client in one period."""
+        try:
+            return _bq(f"""
+                SELECT platform,
+                  SUM(spend) AS spend, SUM(impressions) AS imps,
+                  SUM(clicks) AS clicks, SUM(video_completions) AS vcr,
+                  SAFE_DIVIDE(SUM(spend),SUM(impressions))*1000 AS cpm,
+                  SAFE_DIVIDE(SUM(clicks),SUM(impressions))*100  AS ctr,
+                  SAFE_DIVIDE(SUM(spend),SUM(clicks))            AS cpc,
+                  SAFE_DIVIDE(SUM(spend),SUM(video_completions)) AS cpcv
+                FROM {_BT}
+                WHERE client='{client}' AND date BETWEEN '{start}' AND '{end}'
+                  AND spend > 0
+                GROUP BY platform ORDER BY spend DESC
+            """)
+        except Exception:
+            return pd.DataFrame()
 
-    # ── Sidebar controls ──
+    @st.cache_data(show_spinner=False, ttl=300)
+    def _bm_monthly(client, start, end):
+        try:
+            return _bq(f"""
+                SELECT FORMAT_DATE('%Y-%m', date) AS month,
+                  SUM(spend) AS spend, SUM(impressions) AS imps,
+                  SUM(clicks) AS clicks,
+                  SAFE_DIVIDE(SUM(spend),SUM(impressions))*1000 AS cpm,
+                  SAFE_DIVIDE(SUM(clicks),SUM(impressions))*100  AS ctr,
+                  SAFE_DIVIDE(SUM(spend),SUM(clicks))            AS cpc
+                FROM {_BT}
+                WHERE client='{client}' AND date BETWEEN '{start}' AND '{end}'
+                GROUP BY month ORDER BY month
+            """)
+        except Exception:
+            return pd.DataFrame()
+
+    @st.cache_data(show_spinner=False, ttl=300)
+    def _bm_pool(exclude_client, start, end):
+        """Per-client, per-platform metrics for the pool (excluding one client)."""
+        try:
+            return _bq(f"""
+                SELECT client, platform,
+                  SUM(spend) AS spend, SUM(impressions) AS imps,
+                  SUM(clicks) AS clicks, SUM(video_completions) AS vcr,
+                  SAFE_DIVIDE(SUM(spend),SUM(impressions))*1000 AS cpm,
+                  SAFE_DIVIDE(SUM(clicks),SUM(impressions))*100  AS ctr,
+                  SAFE_DIVIDE(SUM(spend),SUM(clicks))            AS cpc,
+                  SAFE_DIVIDE(SUM(spend),SUM(video_completions)) AS cpcv
+                FROM {_BT}
+                WHERE client != '{exclude_client}'
+                  AND date BETWEEN '{start}' AND '{end}'
+                  AND spend > 0
+                GROUP BY client, platform ORDER BY spend DESC
+            """)
+        except Exception:
+            return pd.DataFrame()
+
+    @st.cache_data(show_spinner=False, ttl=300)
+    def _bm_clients():
+        try:
+            df = _bq(f"SELECT DISTINCT client FROM {_BT} WHERE spend > 0 ORDER BY client")
+            return df["client"].tolist()
+        except Exception:
+            return []
+
+    def _variance_icon(var, lower_better):
+        if var is None:
+            return "—"
+        if (lower_better and var < -5) or (not lower_better and var > 5):
+            return "✅"
+        if (lower_better and var > 5) or (not lower_better and var < -5):
+            return "❌"
+        return "➖"
+
+    def _fmt_metric(val, met_key):
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        if met_key == "ctr":
+            return round(float(val), 3)
+        return round(float(val), 2)
+
+    def _build_comparison_table(focal_df, comp_df, met_key, lower_better,
+                                focal_label, comp_label):
+        """
+        Build a comparison dataframe: focal period vs comparison period, by platform.
+        focal_df / comp_df: DataFrames with columns [platform, spend, cpm, ctr, cpc, cpcv, ...]
+        Returns a display DataFrame.
+        """
+        rows = []
+        for _, r in focal_df.sort_values("spend", ascending=False).iterrows():
+            plat = r["platform"]
+            fval = _fmt_metric(r.get(met_key), met_key)
+            comp_row = comp_df[comp_df["platform"] == plat]
+            cval = _fmt_metric(comp_row.iloc[0].get(met_key), met_key) if not comp_row.empty else None
+            var = round((fval - cval) / max(abs(cval), 0.001) * 100, 1) if fval and cval else None
+            rows.append({
+                "Platform":    plat,
+                "Spend ($)":   round(float(r["spend"]), 0),
+                focal_label:   fval,
+                comp_label:    cval,
+                "Δ %":         var,
+                "":            _variance_icon(var, lower_better),
+            })
+        return pd.DataFrame(rows)
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("##### 1. Date Range")
+        st.markdown("##### 📅 Date Range")
         bm_c1, bm_c2 = st.columns(2)
-        with bm_c1: bm_sd = st.date_input("Start", value=date(2026, 1, 1), min_value=date(2024,1,1), key="bm_sd")
-        with bm_c2: bm_ed = st.date_input("End",   value=date(2026, 4, 14), min_value=bm_sd, key="bm_ed")
+        with bm_c1: bm_sd = st.date_input("Start", value=date(2025, 7, 1),  min_value=date(2025,1,1), key="bm_sd")
+        with bm_c2: bm_ed = st.date_input("End",   value=date(2026, 5, 24), min_value=bm_sd,          key="bm_ed")
         bm_start, bm_end = bm_sd.strftime("%Y-%m-%d"), bm_ed.strftime("%Y-%m-%d")
 
-        st.markdown("##### 2. Client")
-        bm_client_opts = {v["name"]: k for k, v in _MC.items()}
-        bm_client_name = st.selectbox("Client", list(bm_client_opts.keys()),
-                                      label_visibility="collapsed", key="bm_client")
-        bm_client_id   = bm_client_opts[bm_client_name]
+        st.markdown("##### 👤 Client")
+        _bm_all_clients = _bm_clients()
+        if not _bm_all_clients:
+            st.warning("No clients found.")
+            st.stop()
+        _bm_prefill = st.session_state.pop("bench_prefill_client", None)
+        _bm_def_idx = _bm_all_clients.index(_bm_prefill) if _bm_prefill and _bm_prefill in _bm_all_clients else 0
+        bm_client = st.selectbox("Client", _bm_all_clients, index=_bm_def_idx,
+                                 label_visibility="collapsed", key="bm_client")
 
-        st.markdown("##### 3. Campaign")
-        _bm_all_camps = get_campaigns_for_client(bm_client_id, bm_start, bm_end)
-        _bm_camp_opts = {"— All campaigns (aggregated) —": None}
-        for _c in _bm_all_camps:
-            _bm_camp_opts[f"{_c['campaign_name']}  ({_c['start']} → {_c['end']})"] = _c
-        bm_camp_label = st.selectbox("Campaign", list(_bm_camp_opts.keys()),
-                                     label_visibility="collapsed", key="bm_camp")
-        bm_selected_camp = _bm_camp_opts[bm_camp_label]   # None = all campaigns
-
-        st.markdown("##### 4. Metric")
+        st.markdown("##### 📊 Metric")
         bm_metric = st.selectbox("Metric", ["CPM ($)", "CTR (%)", "CPC ($)", "CPCV ($)"],
                                  label_visibility="collapsed", key="bm_metric")
 
-        st.markdown("##### 5. Channel")
-        bm_ch_label = st.selectbox("Channel", ["All", "Digital", "TV", "Radio", "OOH"],
-                                   label_visibility="collapsed", key="bm_ch")
-        bm_ch = {"All":"all","Digital":"digital","TV":"tv","Radio":"radio","OOH":"ooh"}[bm_ch_label]
+        st.markdown("---")
+        if st.button("📈 View in Dashboard", use_container_width=True, key="bm_to_dash"):
+            st.session_state.app_mode = "📈 Dashboard"
+            st.session_state.dash_prefill_client = bm_client
+            st.rerun()
 
-        st.markdown("##### Try asking:")
-        bm_examples = [
-            "How does this campaign's Meta CPM compare to the pool?",
-            "Which platforms is this client most efficient on?",
-            "Where is this campaign underperforming vs own history?",
-            "What's the pool average CPM for Google Search?",
-            "Which channel type has the biggest gap vs pool?",
-        ]
-        for ex in bm_examples:
-            if st.button(ex, use_container_width=True, key=f"bm_{hash(ex)}"):
-                st.session_state["bm_input"] = ex
-
-    # ── Metric config ──
     METRIC_CFG = {
-        "CPM ($)":  {"key": "cpm",  "lower_better": True,  "fmt": "${:.2f}"},
-        "CTR (%)":  {"key": "ctr",  "lower_better": False, "fmt": "{:.3f}%"},
-        "CPC ($)":  {"key": "cpc",  "lower_better": True,  "fmt": "${:.2f}"},
-        "CPCV ($)": {"key": "cpcv", "lower_better": True,  "fmt": "${:.2f}"},
+        "CPM ($)":  {"key": "cpm",  "lower_better": True,  "dollar": True},
+        "CTR (%)":  {"key": "ctr",  "lower_better": False, "dollar": False},
+        "CPC ($)":  {"key": "cpc",  "lower_better": True,  "dollar": True},
+        "CPCV ($)": {"key": "cpcv", "lower_better": True,  "dollar": True},
     }
     mcfg         = METRIC_CFG[bm_metric]
     met_key      = mcfg["key"]
     lower_better = mcfg["lower_better"]
-    dollar_fmt   = "$" in bm_metric
+    met_fmt      = "$%.2f" if mcfg["dollar"] else "%.3f"
+    met_fmt_col  = st.column_config.NumberColumn(format=met_fmt)
 
-    _camp_label_short = bm_selected_camp["campaign_name"] if bm_selected_camp else "All campaigns"
+    # ── 3-month prior window ──────────────────────────────────────────────────
+    prior_end   = bm_sd - _td(days=1)
+    prior_start = (bm_sd.replace(day=1) - _td(days=1)).replace(day=1)
+    prior_start = (prior_start.replace(day=1) - _td(days=1)).replace(day=1)
+    prior_start = (prior_start.replace(day=1) - _td(days=1)).replace(day=1)
+    prior_s, prior_e = prior_start.strftime("%Y-%m-%d"), prior_end.strftime("%Y-%m-%d")
 
     st.markdown(f"""<div class="main-header">
         <h1>🏆 Benchmarks</h1>
-        <p>{bm_client_name}  •  {_camp_label_short}  •  {bm_start} → {bm_end}  •  {bm_ch_label}</p>
+        <p>{bm_client}  •  {bm_metric}  •  {bm_start} → {bm_end}</p>
     </div>""", unsafe_allow_html=True)
 
-    bm_tab_own, bm_tab_pool, bm_tab_ask = st.tabs([
-        "🔄 vs Own History", "🌐 vs Portfolio Pool", "💬 Ask"
+    # ── Load data (all three periods in parallel via cache) ───────────────────
+    with st.spinner("Loading benchmark data…"):
+        df_focal   = _bm_plat(bm_client, bm_start, bm_end)
+        df_prior3  = _bm_plat(bm_client, prior_s, prior_e)
+        df_alltime = _bm_plat(bm_client, "2020-01-01", bm_end)
+        df_pool    = _bm_pool(bm_client, bm_start, bm_end)
+        df_monthly = _bm_monthly(bm_client, "2020-01-01", bm_end)
+
+    if df_focal.empty:
+        st.warning(f"No data for {bm_client} in {bm_start} → {bm_end}.")
+        st.stop()
+
+    # ── Summary KPI row ───────────────────────────────────────────────────────
+    tot_spend = float(df_focal["spend"].sum())
+    tot_imps  = float(df_focal["imps"].sum())
+    tot_clk   = float(df_focal["clicks"].sum())
+    avg_cpm   = tot_spend / max(tot_imps, 1) * 1000
+    avg_ctr   = tot_clk  / max(tot_imps, 1) * 100
+    avg_cpc   = tot_spend / max(tot_clk, 1)
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1: st.metric("💰 Total Spend",  f"${tot_spend:,.0f}")
+    with k2: st.metric("👁️ Impressions",   f"{tot_imps:,.0f}")
+    with k3: st.metric("📊 Avg CPM",       f"${avg_cpm:.2f}")
+    with k4: st.metric("🖱️ CTR",           f"{avg_ctr:.3f}%")
+    with k5: st.metric("💡 Avg CPC",       f"${avg_cpc:.2f}")
+
+    st.markdown("---")
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab_own, tab_3mo, tab_pool = st.tabs([
+        "📊 vs Own Activity",
+        "📅 vs Last 3 Months",
+        "🌐 vs Portfolio Pool",
     ])
 
-    # ── Build selected-campaign platform data ─────────────────────────────────
-    # (cache functions defined at module level for correct st.cache_data behaviour)
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — vs OWN ACTIVITY (all-time client average, excl. selected period)
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_own:
+        st.caption(f"Comparing **{bm_start} → {bm_end}** against {bm_client}'s own all-time performance (excluding this period)")
 
-    # Selected campaign (or aggregated all-client)
-    if bm_selected_camp:
-        focal_plats = _load_camp_plats(
-            bm_client_id,
-            bm_selected_camp["campaign_id"],
-            max(bm_start, bm_selected_camp["start"]),
-            min(bm_end,   bm_selected_camp["end"]),
-            bm_ch,
+        # All-time excluding selected window
+        df_excl = df_alltime[
+            ~((df_alltime["platform"].isin(df_focal["platform"])) & False)  # keep all rows
+        ].copy()
+        # Recompute "all-time excl. selected period" via BQ
+        @st.cache_data(show_spinner=False, ttl=300)
+        def _excl_period(client, sel_start, sel_end):
+            try:
+                return _bq(f"""
+                    SELECT platform,
+                      SUM(spend) AS spend, SUM(impressions) AS imps,
+                      SUM(clicks) AS clicks, SUM(video_completions) AS vcr,
+                      SAFE_DIVIDE(SUM(spend),SUM(impressions))*1000 AS cpm,
+                      SAFE_DIVIDE(SUM(clicks),SUM(impressions))*100  AS ctr,
+                      SAFE_DIVIDE(SUM(spend),SUM(clicks))            AS cpc,
+                      SAFE_DIVIDE(SUM(spend),SUM(video_completions)) AS cpcv
+                    FROM {_BT}
+                    WHERE client='{client}'
+                      AND (date < '{sel_start}' OR date > '{sel_end}')
+                      AND spend > 0
+                    GROUP BY platform ORDER BY spend DESC
+                """)
+            except Exception:
+                return pd.DataFrame()
+
+        df_own_hist = _excl_period(bm_client, bm_start, bm_end)
+
+        cmp_own = _build_comparison_table(
+            df_focal, df_own_hist, met_key, lower_better,
+            focal_label=f"Selected ({bm_start[:7]}→{bm_end[:7]})",
+            comp_label="Own All-time Avg",
         )
-    else:
-        # Aggregate all campaigns for the client
-        all_camp_plats = _load_all_client_plats(bm_client_id, bm_start, bm_end, bm_ch)
-        _agg = _dd(lambda: {"spend": 0, "impressions_proxy": 0, "clicks_proxy": 0})
-        for _cp in all_camp_plats.values():
-            for plat, m in _cp.items():
-                _agg[plat]["spend"] += m.get("spend", 0)
-                # Reconstruct counts from rates for re-averaging
-                sp = m.get("spend", 0)
-                cpm = m.get("cpm") or 0
-                imps = sp / cpm * 1000 if cpm else 0
-                _agg[plat]["impressions_proxy"] += imps
-        focal_plats = {}
-        for plat, d in _agg.items():
-            sp  = d["spend"]
-            imp = d["impressions_proxy"]
-            ch_type = next((v.get("channel","digital") for _, cp in all_camp_plats.items() for p, v in cp.items() if p == plat), "digital")
-            focal_plats[plat] = {
-                "channel": ch_type,
-                "spend":   round(sp, 2),
-                "cpm":     round(sp / imp * 1000, 2) if imp else None,
-                "ctr":     None, "cpc":  None, "cpcv": None,
-            }
 
-    own_rows = []  # C2: initialise before tab blocks so Ask tab can always reference it
-    cmp_rows = []  # same for pool comparison rows
-
-    # ══════════════════════════════════════════════════════════════
-    # TAB 1: vs OWN HISTORY
-    # ══════════════════════════════════════════════════════════════
-    with bm_tab_own:
-
-        all_camp_data = _load_all_client_plats(bm_client_id, bm_start, bm_end, bm_ch)
-
-        if len(all_camp_data) < 2 and bm_selected_camp:
-            st.info("Not enough campaigns in this date range to compare against own history. Widen the date range.")
-        else:
-            # Build "client own average" excluding the selected campaign
-            excl_name = bm_selected_camp["campaign_name"] if bm_selected_camp else None
-            own_pool  = _dd(list)
-            for cname, cplats in all_camp_data.items():
-                if cname == excl_name:
-                    continue
-                for plat, m in cplats.items():
-                    v = m.get(met_key)
-                    if v is not None:
-                        own_pool[plat].append(v)
-            own_avg = {p: round(sum(vs)/len(vs), 3) for p, vs in own_pool.items() if vs}
-
-            # Build comparison rows
-            own_rows = []
-            for plat, m in sorted(focal_plats.items(), key=lambda x: -(x[1].get("spend", 0))):
-                c_val = m.get(met_key)
-                o_val = own_avg.get(plat)
-                ch2   = m.get("channel", "")
-                var   = round((c_val - o_val) / max(abs(o_val), 0.001) * 100, 1) if c_val and o_val else None
-                if var is not None:
-                    beat = "✅" if (lower_better and var < -2) or (not lower_better and var > 2) \
-                           else ("❌" if (lower_better and var > 2) or (not lower_better and var < -2) else "➖")
-                else:
-                    beat = "—"
-                own_rows.append({"platform": plat, "channel": ch2,
-                                 "camp_val": c_val, "own_avg": o_val,
-                                 "var_pct": var, "beat": beat,
-                                 "spend": m.get("spend", 0)})
-
-            # KPI strip
-            own_cmp = [r for r in own_rows if r["camp_val"] and r["own_avg"]]
-            n_beat  = sum(1 for r in own_cmp if r["beat"] == "✅")
-            n_miss  = sum(1 for r in own_cmp if r["beat"] == "❌")
-            n_camps = len(all_camp_data)
-
-            k1, k2, k3, k4 = st.columns(4)
-            with k1: st.metric("Client Campaigns", f"{n_camps}", f"in {bm_start[:4]}–{bm_end[:4]}")
-            with k2: st.metric("Platforms Compared", len(own_cmp))
-            with k3: st.metric(f"Above Own Avg {bm_metric}", f"{n_beat}")
-            with k4: st.metric(f"Below Own Avg {bm_metric}", f"{n_miss}")
+        if not cmp_own.empty:
+            # KPIs
+            has_both = cmp_own.dropna(subset=[f"Selected ({bm_start[:7]}→{bm_end[:7]})", "Own All-time Avg"])
+            n_beat = (has_both[""] == "✅").sum()
+            n_miss = (has_both[""] == "❌").sum()
+            ka, kb, kc = st.columns(3)
+            with ka: st.metric("Platforms Compared", len(has_both))
+            with kb: st.metric("Outperforming Own Avg", f"{n_beat} platforms")
+            with kc: st.metric("Underperforming Own Avg", f"{n_miss} platforms")
 
             st.markdown("---")
 
-            # Per-campaign breakdown table (all campaigns, all platforms)
-            with st.expander(f"📋 All {bm_client_name} campaigns in range", expanded=False):
-                camp_summary = []
-                for cname, cplats in sorted(all_camp_data.items()):
-                    total_spend = sum(v.get("spend", 0) for v in cplats.values())
-                    n_plats     = len(cplats)
-                    avg_met     = None
-                    vals = [v.get(met_key) for v in cplats.values() if v.get(met_key)]
-                    if vals: avg_met = round(sum(vals)/len(vals), 3)
-                    is_focal = "→" if cname == excl_name else ""
-                    camp_summary.append({
-                        "": is_focal,
-                        "Campaign":     cname,
-                        "Spend ($)":    total_spend,
-                        "Platforms":    n_plats,
-                        f"Avg {bm_metric}": avg_met,
-                    })
-                camp_df = pd.DataFrame(camp_summary).sort_values("Spend ($)", ascending=False)
-                st.dataframe(camp_df, use_container_width=True, hide_index=True,
-                             column_config={"Spend ($)": st.column_config.NumberColumn(format="$%,.0f"),
-                                            "": st.column_config.TextColumn(width="small")})
-
-            # Chart + variance
-            if own_cmp:
-                focus_label = excl_name or "All campaigns"
-                chart_df = pd.DataFrame({
-                    focus_label:         {r["platform"].replace("_"," ").title(): r["camp_val"] for r in own_cmp},
-                    f"{bm_client_name} Avg (other campaigns)": {r["platform"].replace("_"," ").title(): r["own_avg"] for r in own_cmp},
-                }).sort_values(focus_label, ascending=(met_key == "cpm"))
-
-                col_chart, col_delta = st.columns([3, 2])
-                with col_chart:
-                    st.markdown(f"**{bm_metric} — {focus_label} vs {bm_client_name} own average**")
-                    st.bar_chart(chart_df)
-                with col_delta:
-                    st.markdown("**Variance vs own average**")
-                    delta_df = pd.DataFrame({
-                        "Variance %": {r["platform"].replace("_"," ").title(): r["var_pct"]
-                                       for r in own_cmp if r["var_pct"] is not None}
-                    }).sort_values("Variance %")
-                    st.bar_chart(delta_df)
-                    direction = "↓ negative = more efficient than usual" if lower_better else "↑ positive = stronger engagement than usual"
-                    st.caption(f"*{direction}*")
+            # Chart
+            focal_col = f"Selected ({bm_start[:7]}→{bm_end[:7]})"
+            chart_data = cmp_own.dropna(subset=[focal_col, "Own All-time Avg"]).set_index("Platform")[[focal_col, "Own All-time Avg"]]
+            if not chart_data.empty:
+                fig = _bgo.Figure()
+                fig.add_bar(name=focal_col,       x=chart_data.index, y=chart_data[focal_col],       marker_color="#4338CA")
+                fig.add_bar(name="Own All-time Avg", x=chart_data.index, y=chart_data["Own All-time Avg"], marker_color="#A5B4FC")
+                fig.update_layout(
+                    barmode="group", height=320,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    legend=dict(orientation="h", y=1.08),
+                    yaxis_title=bm_metric,
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
             st.markdown("---")
-            st.markdown(f"**Platform Detail — {_camp_label_short} vs {bm_client_name} own average**")
-            own_tbl = []
-            for r in own_rows:
-                own_tbl.append({
-                    "Platform":   r["platform"].replace("_"," ").title(),
-                    "Channel":    r["channel"].upper(),
-                    "Spend ($)":  r["spend"],
-                    "This Campaign": r["camp_val"],
-                    f"{bm_client_name} Avg": r["own_avg"],
-                    "vs Own %":   r["var_pct"],
-                    "":           r["beat"],
+            st.markdown("##### Platform Detail")
+            st.dataframe(cmp_own, use_container_width=True, hide_index=True,
+                column_config={
+                    "Spend ($)": st.column_config.NumberColumn(format="$%,.0f"),
+                    focal_col:   met_fmt_col,
+                    "Own All-time Avg": met_fmt_col,
+                    "Δ %":       st.column_config.NumberColumn(format="%.1f%%"),
+                    "":          st.column_config.TextColumn(width="small"),
                 })
-            if own_tbl:
-                own_df = pd.DataFrame(own_tbl).sort_values("Spend ($)", ascending=False)
-                st.dataframe(own_df, use_container_width=True, hide_index=True,
+        else:
+            st.info("Not enough historical data outside the selected period.")
+
+        # Monthly trend
+        if not df_monthly.empty and met_key in df_monthly.columns:
+            st.markdown("---")
+            st.markdown(f"##### 📅 Monthly {bm_metric} Trend (all time)")
+            mo_agg = df_monthly.groupby("month").apply(
+                lambda g: pd.Series({
+                    "spend": g["spend"].sum(),
+                    "imps":  g["imps"].sum(),
+                    "clicks": g["clicks"].sum(),
+                })
+            ).reset_index()
+            mo_agg["cpm"] = mo_agg["spend"] / mo_agg["imps"].clip(lower=1) * 1000
+            mo_agg["ctr"] = mo_agg["clicks"] / mo_agg["imps"].clip(lower=1) * 100
+            mo_agg["cpc"] = mo_agg["spend"] / mo_agg["clicks"].clip(lower=1)
+            fig_mo = _bpx.bar(mo_agg, x="month", y=met_key,
+                              color_discrete_sequence=["#4338CA"],
+                              labels={"month": "", met_key: bm_metric})
+            fig_mo.update_layout(height=240, margin=dict(l=0,r=0,t=10,b=0),
+                                 plot_bgcolor="white", paper_bgcolor="white")
+            # shade the selected window
+            fig_mo.add_vrect(
+                x0=bm_start[:7], x1=bm_end[:7],
+                fillcolor="#F05C2C", opacity=0.12,
+                annotation_text="Selected", annotation_position="top left",
+                line_width=0,
+            )
+            st.plotly_chart(fig_mo, use_container_width=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — vs LAST 3 MONTHS
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_3mo:
+        st.caption(f"Comparing **{bm_start} → {bm_end}** against **{prior_s} → {prior_e}** (3 months prior)")
+
+        cmp_3mo = _build_comparison_table(
+            df_focal, df_prior3, met_key, lower_better,
+            focal_label=f"Selected period",
+            comp_label=f"Prior 3 months",
+        )
+
+        if df_prior3.empty:
+            st.info(f"No data for {bm_client} in the prior 3-month window ({prior_s} → {prior_e}).")
+        elif not cmp_3mo.empty:
+            has_both = cmp_3mo.dropna(subset=["Selected period", "Prior 3 months"])
+            n_beat = (has_both[""] == "✅").sum()
+            n_miss = (has_both[""] == "❌").sum()
+            ka, kb, kc, kd = st.columns(4)
+            with ka: st.metric("Selected period",      f"{bm_start} → {bm_end}")
+            with kb: st.metric("Prior 3-month window", f"{prior_s} → {prior_e}")
+            with kc: st.metric("Platforms improving",  f"{n_beat}")
+            with kd: st.metric("Platforms declining",  f"{n_miss}")
+
+            st.markdown("---")
+
+            chart_data = cmp_3mo.dropna(subset=["Selected period", "Prior 3 months"]).set_index("Platform")[["Selected period", "Prior 3 months"]]
+            if not chart_data.empty:
+                fig = _bgo.Figure()
+                fig.add_bar(name="Selected period",  x=chart_data.index, y=chart_data["Selected period"],  marker_color="#4338CA")
+                fig.add_bar(name="Prior 3 months",   x=chart_data.index, y=chart_data["Prior 3 months"],   marker_color="#A5B4FC")
+                fig.update_layout(
+                    barmode="group", height=320,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    legend=dict(orientation="h", y=1.08),
+                    yaxis_title=bm_metric,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            st.markdown("##### Platform Detail")
+            st.dataframe(cmp_3mo, use_container_width=True, hide_index=True,
+                column_config={
+                    "Spend ($)":       st.column_config.NumberColumn(format="$%,.0f"),
+                    "Selected period": met_fmt_col,
+                    "Prior 3 months":  met_fmt_col,
+                    "Δ %":             st.column_config.NumberColumn(format="%.1f%%"),
+                    "":                st.column_config.TextColumn(width="small"),
+                })
+
+            # Monthly side-by-side trend
+            if not df_monthly.empty:
+                st.markdown("---")
+                st.markdown(f"##### 📅 Monthly {bm_metric} — Selected vs Prior 3 Months")
+                @st.cache_data(show_spinner=False, ttl=300)
+                def _mo_prior(client, ps, pe):
+                    try:
+                        return _bq(f"""
+                            SELECT FORMAT_DATE('%Y-%m', date) AS month,
+                              SAFE_DIVIDE(SUM(spend),SUM(impressions))*1000 AS cpm,
+                              SAFE_DIVIDE(SUM(clicks),SUM(impressions))*100  AS ctr,
+                              SAFE_DIVIDE(SUM(spend),SUM(clicks))            AS cpc
+                            FROM {_BT}
+                            WHERE client='{client}' AND date BETWEEN '{ps}' AND '{pe}'
+                            GROUP BY month ORDER BY month
+                        """)
+                    except Exception:
+                        return pd.DataFrame()
+
+                df_mo_prior = _mo_prior(bm_client, prior_s, prior_e)
+                df_mo_focal_only = df_monthly[
+                    (df_monthly["month"] >= bm_start[:7]) & (df_monthly["month"] <= bm_end[:7])
+                ].groupby("month").apply(
+                    lambda g: pd.Series({"spend": g["spend"].sum(), "imps": g["imps"].sum(), "clicks": g["clicks"].sum()})
+                ).reset_index()
+                df_mo_focal_only["cpm"] = df_mo_focal_only["spend"] / df_mo_focal_only["imps"].clip(lower=1) * 1000
+                df_mo_focal_only["ctr"] = df_mo_focal_only["clicks"] / df_mo_focal_only["imps"].clip(lower=1) * 100
+                df_mo_focal_only["cpc"] = df_mo_focal_only["spend"] / df_mo_focal_only["clicks"].clip(lower=1)
+
+                fig_cmp = _bgo.Figure()
+                if not df_mo_focal_only.empty and met_key in df_mo_focal_only.columns:
+                    fig_cmp.add_scatter(x=df_mo_focal_only["month"], y=df_mo_focal_only[met_key],
+                                        mode="lines+markers", name="Selected period", line_color="#4338CA")
+                if not df_mo_prior.empty and met_key in df_mo_prior.columns:
+                    fig_cmp.add_scatter(x=df_mo_prior["month"], y=df_mo_prior[met_key],
+                                        mode="lines+markers", name="Prior 3 months", line_color="#A5B4FC",
+                                        line=dict(dash="dot"))
+                fig_cmp.update_layout(height=240, margin=dict(l=0,r=0,t=10,b=0),
+                                      plot_bgcolor="white", paper_bgcolor="white",
+                                      legend=dict(orientation="h", y=1.1))
+                st.plotly_chart(fig_cmp, use_container_width=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — vs PORTFOLIO POOL
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_pool:
+        st.caption(f"Comparing **{bm_client}** against all other clients in the portfolio — same period {bm_start} → {bm_end}")
+
+        if df_pool.empty:
+            st.info("No pool data available for this period.")
+        else:
+            pool_clients = df_pool["client"].nunique()
+
+            # Pool average by platform (spend-weighted)
+            pool_by_plat = df_pool.groupby("platform").apply(
+                lambda g: pd.Series({
+                    "spend": g["spend"].sum(),
+                    "imps":  g["imps"].sum(),
+                    "clicks": g["clicks"].sum(),
+                    "vcr":   g["vcr"].sum(),
+                    "cpm":   g["spend"].sum() / max(g["imps"].sum(), 1) * 1000,
+                    "ctr":   g["clicks"].sum() / max(g["imps"].sum(), 1) * 100,
+                    "cpc":   g["spend"].sum() / max(g["clicks"].sum(), 1),
+                    "cpcv":  g["spend"].sum() / max(g["vcr"].sum(), 1),
+                    "n_clients": g["client"].nunique(),
+                })
+            ).reset_index()
+
+            cmp_pool = _build_comparison_table(
+                df_focal, pool_by_plat, met_key, lower_better,
+                focal_label=bm_client,
+                comp_label="Pool Avg",
+            )
+
+            has_both = cmp_pool.dropna(subset=[bm_client, "Pool Avg"])
+            n_beat = (has_both[""] == "✅").sum()
+            n_miss = (has_both[""] == "❌").sum()
+
+            ka, kb, kc, kd = st.columns(4)
+            with ka: st.metric("Pool size",           f"{pool_clients} clients")
+            with kb: st.metric("Platforms compared",  len(has_both))
+            with kc: st.metric("Beating pool avg",    f"{n_beat} platforms")
+            with kd: st.metric("Behind pool avg",     f"{n_miss} platforms")
+
+            st.markdown("---")
+
+            chart_data = has_both.set_index("Platform")[[bm_client, "Pool Avg"]]
+            if not chart_data.empty:
+                fig = _bgo.Figure()
+                fig.add_bar(name=bm_client,   x=chart_data.index, y=chart_data[bm_client],  marker_color="#4338CA")
+                fig.add_bar(name="Pool Avg",  x=chart_data.index, y=chart_data["Pool Avg"],  marker_color="#D1D5DB")
+                fig.update_layout(
+                    barmode="group", height=320,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    legend=dict(orientation="h", y=1.08),
+                    yaxis_title=bm_metric,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            st.markdown("##### Platform Detail")
+            st.dataframe(cmp_pool, use_container_width=True, hide_index=True,
+                column_config={
+                    "Spend ($)":  st.column_config.NumberColumn(format="$%,.0f"),
+                    bm_client:    met_fmt_col,
+                    "Pool Avg":   met_fmt_col,
+                    "Δ %":        st.column_config.NumberColumn(format="%.1f%%"),
+                    "":           st.column_config.TextColumn(width="small"),
+                })
+
+            # Per-client breakdown expander
+            with st.expander("🔍 Individual client breakdown", expanded=False):
+                st.caption("Each client's performance on platforms they share with " + bm_client)
+                focal_plats_set = set(df_focal["platform"].tolist())
+                pool_detail = df_pool[df_pool["platform"].isin(focal_plats_set)].copy()
+                pool_detail = pool_detail[["client", "platform", "spend", met_key]].copy()
+                pool_detail.columns = ["Client", "Platform", "Spend ($)", bm_metric]
+                pool_detail["Spend ($)"] = pool_detail["Spend ($)"].round(0)
+                if met_key == "ctr":
+                    pool_detail[bm_metric] = pool_detail[bm_metric].round(3)
+                else:
+                    pool_detail[bm_metric] = pool_detail[bm_metric].round(2)
+                st.dataframe(pool_detail.sort_values("Spend ($)", ascending=False),
+                             use_container_width=True, hide_index=True,
                              column_config={
-                                 "Spend ($)":       st.column_config.NumberColumn(format="$%,.0f"),
-                                 "This Campaign":   st.column_config.NumberColumn(format="$%.2f" if dollar_fmt else "%.3f"),
-                                 f"{bm_client_name} Avg": st.column_config.NumberColumn(format="$%.2f" if dollar_fmt else "%.3f"),
-                                 "vs Own %":        st.column_config.NumberColumn(format="%.1f%%"),
+                                 "Spend ($)": st.column_config.NumberColumn(format="$%,.0f"),
+                                 bm_metric:   met_fmt_col,
                              })
 
-    # ══════════════════════════════════════════════════════════════
-    # TAB 2: vs PORTFOLIO POOL
-    # ══════════════════════════════════════════════════════════════
-    with bm_tab_pool:
-
-        actuals = _load_actuals(bm_start, bm_end, bm_ch)
-
-        # Pool averages (exclude this client entirely)
-        pool_plat = _dd(list)
-        for cid, cdata in actuals.items():
-            if cid == bm_client_id:
-                continue
-            for plat, m in cdata["platforms"].items():
-                v = m.get(met_key)
-                if v is not None:
-                    pool_plat[plat].append(v)
-        pool_avg = {plat: round(sum(vals)/len(vals), 3) for plat, vals in pool_plat.items() if vals}
-        pool_size = len([k for k in actuals if k != bm_client_id])
-
-        # Comparison rows: focal campaign/aggregation vs pool
-        cmp_rows = []
-        for plat, m in sorted(focal_plats.items(), key=lambda x: -(x[1].get("spend", 0))):
-            c_val   = m.get(met_key)
-            p_val   = pool_avg.get(plat)
-            ch_val2 = m.get("channel", "")
-            var = round((c_val - p_val) / max(abs(p_val), 0.001) * 100, 1) if c_val and p_val else None
-            if var is not None:
-                beat = "✅" if (lower_better and var < -2) or (not lower_better and var > 2) \
-                       else ("❌" if (lower_better and var > 2) or (not lower_better and var < -2) else "➖")
-            else:
-                beat = "—"
-            cmp_rows.append({
-                "platform": plat, "channel": ch_val2,
-                "client_val": c_val, "pool_val": p_val, "var_pct": var, "beat": beat,
-                "spend": m.get("spend", 0),
-            })
-
-        # KPI strip
-        client_plat_list = [r for r in cmp_rows if r["client_val"] and r["pool_val"]]
-        beating = sum(1 for r in client_plat_list if r["beat"] == "✅")
-        missing = sum(1 for r in client_plat_list if r["beat"] == "❌")
-
-        k1, k2, k3, k4 = st.columns(4)
-        with k1: st.metric("Pool Size", f"{pool_size} clients")
-        with k2: st.metric("Platforms Compared", len(client_plat_list))
-        with k3: st.metric(f"Beating Pool {bm_metric}", f"{beating}")
-        with k4: st.metric(f"Behind Pool {bm_metric}", f"{missing}")
-
-        st.markdown("---")
-
-        chart_plats = [r for r in cmp_rows if r["client_val"] and r["pool_val"]]
-        if chart_plats:
-            chart_df = pd.DataFrame({
-                _camp_label_short: {r["platform"].replace("_"," ").title(): r["client_val"] for r in chart_plats},
-                "Pool Average":    {r["platform"].replace("_"," ").title(): r["pool_val"]   for r in chart_plats},
-            }).sort_values(_camp_label_short, ascending=(met_key == "cpm"))
-
-            col_chart, col_delta = st.columns([3, 2])
-            with col_chart:
-                st.markdown(f"**{bm_metric} — {_camp_label_short} vs Portfolio Pool**")
-                st.bar_chart(chart_df)
-            with col_delta:
-                st.markdown("**Variance vs Pool**")
-                delta_df = pd.DataFrame({
-                    "Variance %": {r["platform"].replace("_"," ").title(): r["var_pct"]
-                                   for r in chart_plats if r["var_pct"] is not None}
-                }).sort_values("Variance %")
-                st.bar_chart(delta_df)
-                direction = "↓ negative = client is more efficient" if lower_better else "↑ positive = client has better engagement"
-                st.caption(f"*{direction}*")
-
-        st.markdown("---")
-        st.markdown(f"**Platform Detail — {_camp_label_short} vs Portfolio Pool**")
-        tbl = []
-        for r in cmp_rows:
-            tbl.append({
-                "Platform":          r["platform"].replace("_"," ").title(),
-                "Channel":           r["channel"].upper(),
-                "Spend ($)":         r["spend"],
-                _camp_label_short:   r["client_val"],
-                "Pool Avg":          r["pool_val"],
-                "vs Pool %":         r["var_pct"],
-                "":                  r["beat"],
-            })
-        if tbl:
-            tbl_df = pd.DataFrame(tbl).sort_values("Spend ($)", ascending=False)
-            st.dataframe(tbl_df, use_container_width=True, hide_index=True,
-                         column_config={
-                             "Spend ($)":       st.column_config.NumberColumn(format="$%,.0f"),
-                             _camp_label_short: st.column_config.NumberColumn(format="$%.2f" if dollar_fmt else "%.3f"),
-                             "Pool Avg":        st.column_config.NumberColumn(format="$%.2f" if dollar_fmt else "%.3f"),
-                             "vs Pool %":       st.column_config.NumberColumn(format="%.1f%%"),
-                         })
-
-    # ══════════════════════════════════════════════════════════════
-    # TAB 3: ASK
-    # ══════════════════════════════════════════════════════════════
-    with bm_tab_ask:
-        if "bm_history" not in st.session_state:
-            st.session_state.bm_history = []
-
-        for msg in st.session_state.bm_history:
-            if msg["role"] == "user":
-                st.markdown(f'<div class="chat-msg chat-user">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="chat-msg chat-ai">{msg["content"]}</div>', unsafe_allow_html=True)
-                cost_txt = f" | 💰 ${msg.get('cost', 0.0):.4f}" if "cost" in msg else ""
-                if msg.get("qe"): st.caption(f"🔍 {msg['qe']}{cost_txt}")
-
-        bm_dv = st.session_state.pop("bm_input", "")
-        bq1, bq2 = st.columns([5, 1])
-        with bq1:
-            bm_q = st.text_input("Ask about this client vs the pool...", value=bm_dv,
-                                 placeholder="e.g. Which platforms is this client most efficient on?",
-                                 label_visibility="collapsed", key="bm_qbox")
-        with bq2:
-            bm_send = st.button("Send", type="primary", use_container_width=True, key="bm_send")
-
-        if (bm_send or bm_dv) and bm_q:
-            bm_ctx = {
-                "client_name":   bm_client_name,
-                "campaign":      _camp_label_short,
-                "date_range":    f"{bm_start} → {bm_end}",
-                "comparison":    cmp_rows,        # pool comparison — key expected by llm_engine
-                "vs_own":        own_rows,         # own-history comparison
-                "pool_averages": pool_avg,
-            }
-            with st.spinner("Analysing…"):
-                bm_r = answer_benchmark_question(bm_q, st.session_state.bm_history, context_data=bm_ctx)
-            st.session_state.bm_history.append({"role": "user",    "content": bm_q})
-            st.session_state.bm_history.append({"role": "assistant","content": bm_r["answer"],
-                                                "qe": bm_r.get("query_explanation",""),
-                                                "cost": bm_r.get("cost", 0.0)})
-            st.rerun()
-
-        if st.button("🗑️ Clear", key="bm_clear"):
-            st.session_state.bm_history = []; st.rerun()
-
 # ═══════════════════════════════════════
-# MODE 6: DATA (SuperMetrics pull)
+# MODE 6: WEEKLY MEET
 # ═══════════════════════════════════════
-elif mode == "🗄️ Data":
-    st.markdown("""<div class="main-header">
-        <h1>🗄️ BigQuery Data</h1>
-        <p>Live connection to <code>res-apac-dev-skynet-au · resodigital_MelbUnified.all_clients_unified</code></p>
-    </div>""", unsafe_allow_html=True)
+elif mode == "📅 Weekly Meet":
+    import plotly.express as _wpx
+    import plotly.graph_objects as _wgo
+    from datetime import timedelta as _wdelta
+    from bigquery_data_layer import _run as _wq, TABLE_ID as _WT, get_weekly_meet_data
 
-    from bigquery_data_layer import get_bq_summary, _run, TABLE_ID
-
-    with st.spinner("Fetching BigQuery summary…"):
-        try:
-            summary = get_bq_summary()
-        except Exception as _bq_err:
-            st.error(f"BigQuery connection error: {_bq_err}")
-            st.caption("Make sure ADC is configured: `gcloud auth application-default login`")
-            st.stop()
-
-    if not summary:
-        st.warning("No data found in BigQuery table.")
-        st.stop()
-
-    # ── KPI banner ─────────────────────────────────────────────────────────
-    bq1, bq2, bq3, bq4 = st.columns(4)
-    with bq1: st.metric("Total Rows", f"{summary['row_count']:,}")
-    with bq2: st.metric("Date Range", f"{summary['date_min']} → {summary['date_max']}")
-    with bq3: st.metric("Clients", summary['clients'])
-    with bq4: st.metric("Total Spend", f"${summary.get('total_spend', 0):,.0f}")
-
-    st.markdown("---")
-
-    # ── Rows by client ──────────────────────────────────────────────────────
-    st.markdown("#### Rows & Spend by Client")
-    try:
-        df_clients = _run(f"""
-            SELECT client,
-                   COUNT(*)       AS row_count,
-                   SUM(spend)     AS total_spend,
-                   MIN(date)      AS date_min,
-                   MAX(date)      AS date_max,
-                   COUNT(DISTINCT platform) AS platforms
-            FROM {TABLE_ID}
-            GROUP BY client
-            ORDER BY total_spend DESC
-        """)
-        st.dataframe(df_clients.style.format({"total_spend": "${:,.0f}", "row_count": "{:,}"}),
-                     use_container_width=True)
-    except Exception as _e:
-        st.warning(f"Could not load client breakdown: {_e}")
-
-    st.markdown("---")
-
-    # ── Rows by platform ────────────────────────────────────────────────────
-    st.markdown("#### Rows & Spend by Platform")
-    try:
-        df_plat = _run(f"""
-            SELECT platform,
-                   COUNT(*)  AS row_count,
-                   SUM(spend) AS total_spend
-            FROM {TABLE_ID}
-            GROUP BY platform
-            ORDER BY total_spend DESC
-        """)
-        st.dataframe(df_plat.style.format({"total_spend": "${:,.0f}", "row_count": "{:,}"}),
-                     use_container_width=True)
-    except Exception as _e:
-        st.warning(f"Could not load platform breakdown: {_e}")
-
-    st.markdown("---")
-
-    # ── Raw SQL explorer ────────────────────────────────────────────────────
-    st.markdown("#### SQL Explorer")
-    st.caption("Run any SELECT query against the unified table.")
-    default_sql = f"SELECT client, platform, date, spend, impressions\nFROM {TABLE_ID}\nORDER BY date DESC\nLIMIT 50"
-    user_sql = st.text_area("SQL", value=default_sql, height=120, key="bq_sql_input")
-    if st.button("▶ Run Query", key="bq_run"):
-        with st.spinner("Querying BigQuery…"):
-            try:
-                df_result = _run(user_sql)
-                st.success(f"{len(df_result):,} rows returned")
-                st.dataframe(df_result, use_container_width=True)
-            except Exception as _qe:
-                st.error(f"Query error: {_qe}")
-
-# ═══════════════════════════════════════
-# MODE 7: AUTOMATED OPTIMIZATION
-# ═══════════════════════════════════════
-elif mode == "⚡ Automated Optimization":
-    from llm_engine import generate_optimizations
-    
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("##### 1. Date Range")
-        oc1, oc2 = st.columns(2)
-        with oc1: osd = st.date_input("Start", value=date(2025, 1, 1), min_value=date(2024, 1, 1), key="opt_sd")
-        with oc2: oed = st.date_input("End", value=date(2025, 12, 31), min_value=osd, key="opt_ed")
-        oss, oes = osd.strftime("%Y-%m-%d"), oed.strftime("%Y-%m-%d")
+        st.markdown("##### Client")
 
-        st.markdown("##### 2. Client")
-        o_clients = get_clients_in_date_range(oss, oes)
-        o_co = {c["client_name"]: c["client_id"] for c in o_clients}
-        if not o_co: st.warning("No clients."); st.stop()
-        o_cn = st.selectbox("Client", list(o_co.keys()), label_visibility="collapsed", key="opt_cl")
-        o_ci = o_co[o_cn]
-
-        st.markdown("##### 3. Campaign")
-        o_camps = get_campaigns_for_client(o_ci, oss, oes)
-        o_cop = {f"{c['campaign_name']}  ({c['start']} → {c['end']})": c for c in o_camps}
-        if not o_cop: st.warning("No campaigns."); st.stop()
-        o_scl = st.selectbox("Campaign", list(o_cop.keys()), label_visibility="collapsed", key="opt_camp")
-        o_sc = o_cop[o_scl]
-
-        st.markdown("---")
-        run_opt = st.button("🚀 Run Agentic Scan", type="primary", use_container_width=True)
-
-    st.markdown(f"""<div class="main-header">
-        <h1>🤖 Agentic Optimization</h1>
-        <p>{o_cn}  •  {o_sc['campaign_name']}  •  Automated Platform Recommendations</p>
-    </div>""", unsafe_allow_html=True)
-    
-    _cache_key = (o_ci, o_sc["campaign_id"], oss, oes, ch_val)
-
-    if run_opt:
-        if st.session_state.get("_opt_cache_key") == _cache_key and "opt_result" in st.session_state:
-            st.toast("Using cached scan results.", icon="💾")
-        else:
-            with st.spinner("Analyzing live data..."):
-                sdata = assemble_pca_data(o_ci, o_sc["campaign_id"], o_sc["start"], o_sc["end"], ch_val)
-                result = generate_optimizations(sdata)
-                st.session_state["opt_result"] = result.get("optimizations", [])
-                st.session_state["_opt_cache_key"] = _cache_key
-                # initialize checkboxes
-                for i in range(len(st.session_state["opt_result"])):
-                    st.session_state[f"opt_chk_{i}"] = False
-
-    if "opt_result" not in st.session_state:
-        st.info("Select a campaign in the sidebar and click **Run Agentic Scan** to identify optimizations.")
-        st.stop()
-
-    opts = st.session_state["opt_result"]
-    if not opts:
-        st.warning("No optimizations could be generated for this campaign constraint.")
-        st.stop()
-
-    st.markdown("### Suggested Platform Actions")
-    
-    selected_any = False
-    for i, opt in enumerate(opts):
-        conf = opt.get("confidence", 0)
-        c_color = "var(--green)" if conf > 0.8 else "var(--orange)"
-        
-        html_container = f"""<div style="background: white; border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 12px; box-shadow: var(--sh-sm);">
-<div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
-<div>
-<span class="storyline-badge" style="background: {c_color}22; color: {c_color};">⚡ {int(conf*100)}% Confidence</span>
-<span class="storyline-badge">🖥️ {opt.get('platform', 'Platform')}</span>
-<strong style="font-size: 16px; color: var(--navy);">{opt.get('action', '')}</strong>
-</div>
-</div>
-<p style="color: var(--text-2); font-size: 14px; margin: 4px 0 12px 0; line-height: 1.5;">{opt.get('rationale', '')}</p>
-<div style="display: flex; gap: 20px; align-items: center; background: var(--bg); padding: 12px; border-radius: 8px; margin-bottom: 12px;">
-<div style="flex: 1;">
-<div style="font-size: 11px; color: var(--text-3); text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">Predicted Impact</div>
-<div style="font-size: 14px; font-weight: 600; color: var(--navy);">{opt.get('expected_impact', '')}</div>
-</div>
-<div style="flex: 1;">
-<div style="font-size: 11px; color: var(--text-3); text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">Confidence ({int(conf*100)}%)</div>
-<div style="height: 8px; background: var(--border); border-radius: 4px; width: 100%; overflow: hidden;">
-<div style="height: 100%; width: {int(conf*100)}%; background: {c_color};"></div>
-</div>
-</div>
-</div>
-</div>"""
-        st.markdown(html_container, unsafe_allow_html=True)
-        # Checkbox for selection outside markdown
-        is_sel = st.checkbox("Select this optimization", key=f"opt_chk_{i}")
-        if is_sel: selected_any = True
-        st.markdown("<div style='margin-bottom: 24px;'></div>", unsafe_allow_html=True)
-        
-    st.markdown("---")
-    c1, c2 = st.columns([1, 4])
-    with c1:
-        if st.button("⚡ Deploy Selected", disabled=not selected_any, type="primary"):
-            st.session_state.deploy_running = True
-            
-    if st.session_state.get("deploy_running"):
-        prog = st.progress(0, "Connecting to platform APIs...")
-        time.sleep(1)
-        prog.progress(30, "Authenticating and pushing changes...")
-        time.sleep(1.5)
-        prog.progress(70, "Validating active budget limits...")
-        time.sleep(1)
-        prog.progress(100, "Changes successfully deployed!")
-        time.sleep(1)
-        prog.empty()
-        st.success("✅ Selected optimizations have been queued and pushed to platform accounts.")
-        st.session_state.deploy_running = False
-
-# ═══════════════════════════════════════
-# MODE 8: MEDIA STRATEGY BUILDER
-# ═══════════════════════════════════════
-elif mode == "🧠 Media Strategy Builder":
-    from llm_engine import generate_media_strategy
-    from excel_builder import build_media_strategy_excel
-    from pptx_builder import build_media_strategy_pptx
-    from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data, get_live_clients as _msb_glc
-    from live_analytics import get_portfolio_benchmarks
-    MOCK_CLIENTS = _msb_glc()
-
-    st.markdown("""<div class="main-header">
-        <h1>🧠 Media Strategy Builder</h1>
-        <p>Upload a client brief → AI reads your campaign history + market data → generates a full media strategy with Excel plan + presentation</p>
-    </div>""", unsafe_allow_html=True)
-
-    # ── Known brief → client mapping ──────────────────────────────────────────
-    _BRIEF_CLIENT_MAP = {
-        "OMD FY25 Strategic Brief": "Belong",
-    }
-
-    # ── Parsed summary cards for known briefs ─────────────────────────────────
-    _BRIEF_SUMMARIES = {
-        "OMD FY25 Strategic Brief": {
-            "client":    "Belong",
-            "category":  "Telco — value-positioned MVNO (Telstra subsidiary)",
-            "period":    "FY25 (Full Year)",
-            "budget":    "TBC — baseline budget + incremental activity model",
-            "objectives": [
-                "Win and retain customers, increase ARPU, operate more efficiently",
-                "Increase Consideration to Conversion +40% (from FY24 baseline: 21%)",
-                "Grow Prompted Awareness above 53%",
-            ],
-            "sales_targets": [
-                "Mobile: 40k Net Adds (incremental 24.3k SIOs)",
-                "Fixed/NBN: 30k Net Adds (incremental 15.7k SIOs)",
-            ],
-            "audiences": [
-                "NBN — Renters, Refinancers, Rage Quitters, Retail Re-Evaluators, Movers",
-                "Mobile — BBL/WBBL Fans, Internationals/Migrants, Frantic Families, Cost-pressured individuals",
-                "Financial decision maker in the household",
-            ],
-            "key_messages": [
-                "More of the Good Stuff — products & value proposition",
-                "Best value-for-money experience (Belong 59% vs industry 33% on value affordability)",
-                "Cannot use word 'value' legally — must communicate through benefits and emotional drivers",
-            ],
-            "challenges": [
-                "Low unprompted awareness — prospects don't know what Belong offers beyond 'value'",
-                "Campaign hasn't sustained perception gains — sentiment ambivalent among non-customers",
-                "Belong eco-system is digital-only — difficult to bring into real-world environments",
-                "Sydney Sixers BBL/WBBL & JB-HiFi sponsorships need better integration",
-            ],
-            "seasonality": [
-                "Mobile peak: Black Friday & XMAS (Nov–Jan) — Bonus Data + Retail SIM offers",
-                "NBN peak: Q4 Mover's season (Jan–Mar) — sales dip at XMAS & Easter",
-            ],
-            "pages": 17,
-        }
-    }
-
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("##### 1. Upload Brief")
-        brief_file = st.file_uploader("Client brief (PDF)", type=["pdf"], label_visibility="collapsed")
-
-        st.markdown("##### 2. Client")
-        ms_clients = get_clients_in_date_range("2024-01-01", "2026-12-31")
-        ms_co = {c["client_name"]: c["client_id"] for c in ms_clients}
-        if not ms_co:
-            st.warning("No clients found.")
-            st.stop()
-
-        # Auto-select client based on uploaded brief filename
-        _default_client = list(ms_co.keys())[0]
-        if brief_file:
-            fn_lower = brief_file.name.lower().replace(" ", "").replace("_", "").replace("-", "")
-            for key, cname in _BRIEF_CLIENT_MAP.items():
-                if key.lower().replace(" ", "") in fn_lower:
-                    if cname in ms_co:
-                        _default_client = cname
-                    break
-        _client_idx = list(ms_co.keys()).index(_default_client) if _default_client in ms_co else 0
-        ms_cn = st.selectbox("Client", list(ms_co.keys()), index=_client_idx, label_visibility="collapsed", key="ms_client")
-        ms_ci = ms_co[ms_cn]
-
-        st.markdown("##### 3. Options")
-        ms_budget = st.text_input("Total budget (optional)", placeholder="e.g. $2.5M", key="ms_budget")
-        ms_period = st.text_input("Campaign period (optional)", placeholder="e.g. Q1–Q3 FY26", key="ms_period")
-        ms_focus  = st.text_area("Additional context", placeholder="e.g. New product launch, focus on 25-44, heavy Metro", height=80, key="ms_focus")
-
-        st.markdown("---")
-        ms_run = st.button("🚀 Build Strategy", type="primary", use_container_width=True)
-
-    # ── Hardcoded brief library (for image-based demo PDFs) ──────────────────
-    _KNOWN_BRIEFS = {
-        "OMD FY25 Strategic Brief": """
-CLIENT: Belong (Telco — Telstra subsidiary, value-positioned MVNO)
-BRIEF: FY25 Strategic Brief — Media & Creative
-PREPARED BY: OMD Australia
-
-═══════════════════════════════════════
-THE CHALLENGE (WHY)
-═══════════════════════════════════════
-Primary challenge is unprompted awareness and recognition — and how that translates into sales performance. Much of the market doesn't know who Belong is or what they offer beyond 'value'. We want to make sure we have the right people knowing the right attributes to drive value perception, so we are working for prospective customers to create a baseline of creative and media strategies for the next financial year.
-
-There are heaps of proof points not yet heroised in market (6.5/1.2) that would demonstrate how we offer 'more of the good stuff'.
-
-THE GOOD STUFF RESEARCH: The campaign highlights products and value proposition and is associated with an increase in brand consideration. However the campaign hasn't increased awareness and the increase in perception hasn't been sustained. Sentiment remains mostly ambivalent among non-customers — they still say they don't know enough about Belong to decide whether to put Belong on their list.
-
-MEDIA CHALLENGE:
-- The media plan (with budgets) needs to be able to adapt to market conditions
-- How we can better support (and sweat) our existing partners and retail channels — this includes JB-HiFi and the Sydney Sixers to capitalise on their credibility and mental availability with consumers
-- The Belong eco-system is currently a digital (black) world. Bringing this into the real world using the player real-estate available is incredibly difficult. To integrate more seamlessly through the season we could explore placement relevant to this audience.
-
-CREATIVE CHALLENGE:
-- Maintain 'More of the good stuff' campaign collateral, altering and personalising the messaging for our segments
-- Talking to benefits and values that make sense to the target audience
-- Given the legal challenges and the average of displaying "Great Value", how can we display value without saying "value" in order to communicate the benefits and emotional drivers — i.e. the product attributes which acquire our customers
-- We can't be all things to all people. Understand what message works for each audience, and in what format
-
-═══════════════════════════════════════
-OBJECTIVES (WHAT)
-═══════════════════════════════════════
-Overall: Win and retain customers, increase ARPU and operate more efficiently.
-
-To do this we need to develop a brand campaign and media plan that can shift with changing market conditions, without needing mass amounts of rework, like our previous ways of working.
-
-BUSINESS OBJECTIVES:
-- Formalised OKRs will be populated end of April — refer to the Excel document titled "Targets for OMD"
-
-BRAND OBJECTIVES (Improve Upon FY24):
-- Consideration to Conversion: +40%
-- Consideration: 21%
-- Prompted Awareness: 53%
-
-SALES TARGETS:
-- Mobile: Ambition Target 40k Net Adds for PPIH (incremental 24.3k SIOs)
-- Fixed/NBN: Ambition Target 30k Net Adds for NBN (incremental 15.7k SIOs)
-
-SEASONALITY — MOBILE:
-Key trading periods are Black Friday & XMAS (Nov–Jan) with momentum driven by Bonus Data offers as well as Retail SIM / catalogue activity. FY25 saw less volatility in monthly movements compared to FY22, with Black Fri/XMAS period performance slightly softer. FY23 offer was Double Data on $35+ Plans vs FY22 Double Data on all Plans. Would expect FY24 to have a smaller lift too as we are running a smaller offer of +20GB on $35+ Plans.
-
-SEASONALITY — NBN:
-Decline in NBN Activations from FY23–24 as portfolio has been impacted by: price rises, exit of many Channel partners. Key trading period in NBN is Q4 Mover's season (Jan–Mar) and sales dip during XMAS and Easter breaks. BYO Modem option introduced in mid-Mar Q4 FY22. Price rises in Sep–Nov periods for FY23 (+$5 NBN25/NBN50) and FY24 (+$5 on NBN50). Partner channel decline from Q2 FY23.
-
-═══════════════════════════════════════
-TARGET AUDIENCE (WHO)
-═══════════════════════════════════════
-Refocus the target market: based on what we know, there are four potential intent-based audiences that have aligned needs of affordability and reliability for consideration and validation. We also need to reach the financial decision maker in the household.
-
-NBN Specific Audiences:
-- Renters — Affordable NBN that is easy to connect and move
-- Refinancers — NBN that is optimised to my budget
-- Rage Quitters — Quality of service that I can afford
-- Retail Re-Evaluators — The Telstra network at a price I can afford
-- Movers — Those in the market and ready to explore other options
-
-Mobile Specific Audiences:
-- BBL/WBBL Fans
-- Internationals / Migrants
-- Frantic Families
-- Cost-pressured individuals — students, first time out-of-homers, renters saving for their first home
-
-BRAND HEALTH (Jan–24 tracking):
-- Value Affordability: Belong 59% vs Industry 33% (Brand Leader)
-- Plan Inclusions: 47% → 45%
-- Network: 36% → 33%
-- Simplicity: 7% → 9%
-- Brand: 5% → 8%
-- Offer Clarity & Relevance: 4% → 3%
-- Rewards & Recognition: 1% → 2%
-
-MOBILE VALUE DRIVERS:
-- Postpaid mobile acquisition remains highly price-led; price is around twice as impactful in assessing value than quality
-- When assessing quality of Postpaid Mobile providers, plan inclusions and network performance are still most impactful across both acquisition and retention
-- Belong is perceived best value for money experience amongst providers tracked
-- Belong moved into high value among non-customers and remained high value amongst own customers
-- This puts Belong in a strong position to both acquire new and retain existing customers
-- How Belong can improve its value: continue to reinforce strong value for money (especially price, offer clarity/relevance, plan inclusions and customer service); improve perceptions of network, brand and potentially rewards/recognition
-
-BUDGETS:
-- Primary recommendations must fit within the budget
-- As mentioned previously we want to have a baseline budget then incremental activity (and budget) to incorporate which could change to chase performance and growth
-- Budgets: primary recommendations must fit within the budget
-
-═══════════════════════════════════════
-ADDITIONAL CONTEXT
-═══════════════════════════════════════
-- Sydney Sixers BBL/WBBL sponsorship is a key partnership to activate
-- JB-HiFi retail channel partnership should be leveraged
-- Campaign must be channel-agnostic and adapt creative for different placements
-- Sponsorship: location & message specific — applying to everyone at anytime vs. sponsorship-location-specific messaging
-- Total Creative Timelines: 20 creative executions planned
-- Belong is perceived as best value-for-money, key differentiator vs Optus, Vodafone, Telstra
-- Legal constraint: cannot use the word "value" directly — must communicate value through benefits and emotional drivers
-"""
-    }
-
-    def _match_known_brief(filename: str):
-        """Return hardcoded brief text if filename matches a known brief."""
-        fn_lower = (filename or "").lower()
-        for key, text in _KNOWN_BRIEFS.items():
-            if key.lower().replace(" ", "") in fn_lower.replace(" ", "").replace("_", "").replace("-", ""):
-                return text
-        return None
-
-    # ── Brief text extraction ─────────────────────────────────────────────────
-    brief_text = ""
-    brief_source = ""
-
-    if brief_file is not None:
-        # Check for known hardcoded brief first
-        hardcoded = _match_known_brief(brief_file.name)
-        if hardcoded:
-            brief_text   = hardcoded
-            brief_source = "hardcoded"
-        else:
-            # Try PDF text extraction
+        @st.cache_data(show_spinner=False, ttl=300)
+        def _wm_clients():
             try:
-                import pdfplumber, io
-                with pdfplumber.open(io.BytesIO(brief_file.read())) as pdf:
-                    for page in pdf.pages:
-                        t = page.extract_text()
-                        if t:
-                            brief_text += t + "\n"
+                df = _wq(f"SELECT DISTINCT client FROM {_WT} WHERE spend > 0 ORDER BY client")
+                return df["client"].tolist()
             except Exception:
-                pass
-            brief_source = "extracted" if len(brief_text.strip()) > 100 else "fallback"
+                return []
 
-    if ms_budget:
-        brief_text += f"\n\nBudget: {ms_budget}"
-    if ms_period:
-        brief_text += f"\nCampaign Period: {ms_period}"
-    if ms_focus:
-        brief_text += f"\nAdditional context: {ms_focus}"
+        _wm_client_list = _wm_clients()
+        if not _wm_client_list:
+            st.warning("No clients found in BigQuery.")
+            st.stop()
 
-    # ── Show brief status + parsed summary ────────────────────────────────────
-    if brief_file:
-        if brief_source == "hardcoded":
-            st.success(f"📄 **{brief_file.name}** — brief fully parsed ✅")
-        elif brief_source == "extracted":
-            st.success(f"📄 **{brief_file.name}** — {len(brief_text):,} characters extracted")
-        else:
-            st.warning(f"📄 **{brief_file.name}** — image-based PDF, limited extraction. Add context in sidebar fields.")
+        wm_client = st.selectbox("Client", _wm_client_list, label_visibility="collapsed", key="wm_client")
 
-        # Find matching summary card
-        _summary = None
-        if brief_file:
-            fn_lower = brief_file.name.lower().replace(" ", "").replace("_", "").replace("-", "")
-            for key, summ in _BRIEF_SUMMARIES.items():
-                if key.lower().replace(" ", "") in fn_lower:
-                    _summary = summ
-                    break
+        st.markdown("##### Week ending")
+        _today       = date.today()
+        _default_end = _today - _wdelta(days=1)   # yesterday by default
 
-        if _summary:
-            st.markdown("---")
-            st.markdown("#### 📋 Brief Summary")
+        wm_end = st.date_input("Week ending", value=_default_end,
+                               label_visibility="collapsed", key="wm_end")
 
-            # Top meta row
-            m1, m2, m3, m4 = st.columns(4)
-            with m1: st.markdown(f'<div class="kpi-card"><div class="kpi-label">Client</div><div class="kpi-value" style="font-size:16px;">{_summary["client"]}</div><div class="kpi-sub">{_summary["category"]}</div></div>', unsafe_allow_html=True)
-            with m2: st.markdown(f'<div class="kpi-card"><div class="kpi-label">Campaign Period</div><div class="kpi-value" style="font-size:16px;">{_summary["period"]}</div><div class="kpi-sub">&nbsp;</div></div>', unsafe_allow_html=True)
-            with m3: st.markdown(f'<div class="kpi-card"><div class="kpi-label">Budget</div><div class="kpi-value" style="font-size:14px;">{_summary["budget"]}</div><div class="kpi-sub">&nbsp;</div></div>', unsafe_allow_html=True)
-            with m4: st.markdown(f'<div class="kpi-card"><div class="kpi-label">Brief Pages</div><div class="kpi-value" style="font-size:16px;">{_summary["pages"]}</div><div class="kpi-sub">pages extracted</div></div>', unsafe_allow_html=True)
-
-            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-
-            row1_left, row1_right = st.columns(2)
-
-            with row1_left:
-                st.markdown(
-                    '<div class="slide-card">'
-                    '<div class="kpi-label" style="margin-bottom:8px;">🎯 Objectives</div>'
-                    + "".join(f'<div style="font-size:13px;color:#374151;padding:4px 0;border-bottom:1px solid #F0F2F6;">• {o}</div>' for o in _summary["objectives"])
-                    + '</div>', unsafe_allow_html=True
-                )
-                st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-                st.markdown(
-                    '<div class="slide-card">'
-                    '<div class="kpi-label" style="margin-bottom:8px;">📈 Sales Targets</div>'
-                    + "".join(f'<div style="font-size:13px;color:#374151;padding:4px 0;border-bottom:1px solid #F0F2F6;">• {t}</div>' for t in _summary["sales_targets"])
-                    + '</div>', unsafe_allow_html=True
-                )
-                st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-                st.markdown(
-                    '<div class="slide-card">'
-                    '<div class="kpi-label" style="margin-bottom:8px;">📅 Seasonality</div>'
-                    + "".join(f'<div style="font-size:13px;color:#374151;padding:4px 0;border-bottom:1px solid #F0F2F6;">• {s}</div>' for s in _summary["seasonality"])
-                    + '</div>', unsafe_allow_html=True
-                )
-
-            with row1_right:
-                st.markdown(
-                    '<div class="slide-card">'
-                    '<div class="kpi-label" style="margin-bottom:8px;">👥 Target Audiences</div>'
-                    + "".join(f'<div style="font-size:13px;color:#374151;padding:4px 0;border-bottom:1px solid #F0F2F6;">• {a}</div>' for a in _summary["audiences"])
-                    + '</div>', unsafe_allow_html=True
-                )
-                st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-                st.markdown(
-                    '<div class="slide-card">'
-                    '<div class="kpi-label" style="margin-bottom:8px;">💬 Key Messages</div>'
-                    + "".join(f'<div style="font-size:13px;color:#374151;padding:4px 0;border-bottom:1px solid #F0F2F6;">• {m}</div>' for m in _summary["key_messages"])
-                    + '</div>', unsafe_allow_html=True
-                )
-                st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-                st.markdown(
-                    '<div class="slide-card">'
-                    '<div class="kpi-label" style="margin-bottom:8px;">⚠️ Key Challenges</div>'
-                    + "".join(f'<div style="font-size:13px;color:#374151;padding:4px 0;border-bottom:1px solid #F0F2F6;">• {c}</div>' for c in _summary["challenges"])
-                    + '</div>', unsafe_allow_html=True
-                )
-
-            st.markdown("---")
-
-    else:
-        st.info("Upload a client brief PDF in the sidebar, or fill in the context fields, then click **Build Strategy**.")
-
-    # ── Run ───────────────────────────────────────────────────────────────────
-    _ms_cache_key = (ms_ci, ms_budget, ms_period, ms_focus, brief_text[:200] if brief_text else "")
-
-    if ms_run:
-        if st.session_state.get("_ms_cache_key") == _ms_cache_key and "ms_result" in st.session_state:
-            st.toast("Showing cached strategy. Change inputs to regenerate.", icon="💾")
-        else:
-            st.session_state.pop("ms_result", None)
-
-            _ms_prog = st.progress(0, "Initialising…")
-
-            # Step 1 — gather client history
-            _ms_prog.progress(5, "📦 Pulling client campaign history…")
-            all_client_campaigns = get_campaigns_for_client(ms_ci, "2024-01-01", "2026-12-31")
-            client_history_data = {"client_name": ms_cn, "campaigns": []}
-            for camp in all_client_campaigns[:8]:  # cap at 8 most recent campaigns
-                try:
-                    camp_data = assemble_pca_data(ms_ci, camp["campaign_id"], camp["start"], camp["end"], "all")
-                    camp_data["_campaign_name"] = camp["campaign_name"]
-                    camp_data["_dates"] = f"{camp['start']} → {camp['end']}"
-                    client_history_data["campaigns"].append({
-                        "name": camp["campaign_name"],
-                        "dates": f"{camp['start']} → {camp['end']}",
-                        "overview": camp_data.get("overview", []),
-                        "total_spend": sum(o.get("total_spend", 0) for o in camp_data.get("overview", [])),
-                    })
-                except Exception:
-                    pass
-
-            # Step 2 — gather market context
-            _ms_prog.progress(15, "📊 Pulling market benchmarks…")
-            market_context = {
-                "portfolio_benchmarks": get_portfolio_benchmarks("all"),
-                "note": "Benchmarks aggregated from all clients in portfolio (excluding selected client where possible)"
-            }
-
-            # Step 3 — LLM
-            _ms_prog.progress(20, "🧠 Building strategy with AI…")
-            strategy = generate_media_strategy(brief_text, client_history_data, market_context)
-            _ms_prog.progress(85, "✅ Strategy generated")
-
-            # Step 4 — Excel
-            _ms_prog.progress(86, "📗 Building media plan (Excel)…")
-            ms_xlsx = os.path.join(_TMPDIR, "media_strategy.xlsx")
-            build_media_strategy_excel(strategy, ms_xlsx)
-            _ms_prog.progress(93, "✅ Excel done")
-
-            # Step 5 — PPTX
-            _ms_prog.progress(94, "📙 Building strategy deck (PowerPoint)…")
-            ms_pptx = os.path.join(_TMPDIR, "media_strategy.pptx")
-            build_media_strategy_pptx(strategy, ms_pptx)
-            _ms_prog.progress(100, "✅ Complete")
-            time.sleep(0.4)
-            _ms_prog.empty()
-
-            st.session_state["ms_result"]     = {"strategy": strategy, "xlsx": ms_xlsx, "pptx": ms_pptx}
-            st.session_state["_ms_cache_key"] = _ms_cache_key
-            st.rerun()
-
-    # ── Display result ────────────────────────────────────────────────────────
-    if "ms_result" not in st.session_state:
-        st.stop()
-
-    result   = st.session_state["ms_result"]
-    strategy = result["strategy"]
-
-    if strategy.get("_error"):
-        st.error(f"LLM error — showing mock strategy. **{strategy['_error']}**")
-
-    s = strategy
-
-    # ── KPI bar ──────────────────────────────────────────────────────────────
-    alloc      = s.get("budget_allocation", [])
-    n_channels = len(s.get("channel_mix", []))
-    n_months   = len(s.get("monthly_flight", []))
-    n_recs     = len(s.get("recommendations", []))
-    meta       = s.get("_metadata", {})
-    llm_cost   = meta.get("cost", 0.0)
-    llm_tokens = meta.get("tokens", 0)
-    llm_model  = meta.get("model", "")
-    cost_sub   = f"{llm_tokens:,} tokens" + (f"  ·  {llm_model}" if llm_model and llm_model != "mock" else "")
-
-    kpi_cols = st.columns(5)
-    for col, (label, val, sub) in zip(kpi_cols, [
-        ("Client",        ms_cn,                    s.get("brief_summary", {}).get("campaign_period", "")),
-        ("Budget",        s.get("brief_summary", {}).get("budget_indication", ms_budget or "TBD"), "as briefed"),
-        ("Channels",      f"{n_channels}",           "in recommended mix"),
-        ("Flight Months", f"{n_months}",             "in plan"),
-        ("Generation Cost", f"${llm_cost:.4f}",      cost_sub),
-    ]):
-        with col:
-            st.markdown(f'<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Downloads ─────────────────────────────────────────────────────────────
-    dl1, dl2, dl3 = st.columns(3)
-    with dl1:
-        with open(result["pptx"], "rb") as f:
-            st.download_button("📙 Strategy Deck (.pptx)", f.read(),
-                               file_name=f"MediaStrategy_{ms_cn}.pptx",
-                               mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                               use_container_width=True)
-    with dl2:
-        with open(result["xlsx"], "rb") as f:
-            st.download_button("📗 Media Plan (.xlsx)", f.read(),
-                               file_name=f"MediaPlan_{ms_cn}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
-    with dl3:
-        st.download_button("📋 Strategy JSON", json.dumps(s, indent=2).encode(),
-                           file_name=f"MediaStrategy_{ms_cn}.json",
-                           mime="application/json",
-                           use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Strategy preview tabs ─────────────────────────────────────────────────
-    ms_t1, ms_t2, ms_t3, ms_t4, ms_t5 = st.tabs([
-        "📋 Strategy Overview", "📡 Channel Mix", "📅 Flight Plan", "💡 Insights & Learnings", "🔧 Raw JSON"
-    ])
-
-    # ── TAB 1: Strategy Overview ──────────────────────────────────────────────
-    with ms_t1:
-        bs  = s.get("brief_summary", {})
-        sa  = s.get("strategic_approach", {})
-
-        st.markdown(f'<div class="so-what" style="font-size:15px;font-weight:600;">🎯 {s.get("strategy_headline","")}</div>', unsafe_allow_html=True)
-        st.markdown(s.get("executive_summary", ""), unsafe_allow_html=False)
-
-        c_left, c_right = st.columns(2)
-
-        with c_left:
-            st.markdown("**Brief Summary**")
-            st.markdown(f"- **Period:** {bs.get('campaign_period','')}")
-            st.markdown(f"- **Budget:** {bs.get('budget_indication','')}")
-            st.markdown(f"- **Audience:** {bs.get('target_audience','')}")
-            objs = bs.get("objectives", [])
-            if objs:
-                st.markdown("**Objectives:**")
-                for o in objs:
-                    st.markdown(f"  - {o}")
-            msgs = bs.get("key_messages", [])
-            if msgs:
-                st.markdown("**Key Messages:**")
-                for m in msgs:
-                    st.markdown(f"  - {m}")
-
-        with c_right:
-            st.markdown("**Strategic Approach**")
-            st.markdown(f"**Positioning:** {sa.get('positioning','')}")
-            st.markdown(f"**Channel Philosophy:** {sa.get('channel_philosophy','')}")
-            tensions = sa.get("key_tensions", [])
-            if tensions:
-                st.markdown("**Key Tensions:**")
-                for t in tensions:
-                    st.markdown(f"  - {t}")
-
-        recs = s.get("recommendations", [])
-        if recs:
-            st.markdown("---")
-            st.markdown("**Recommendations**")
-            for rec in recs:
-                prio  = rec.get("priority", "MEDIUM")
-                color = {"HIGH": "#DC2626", "MEDIUM": "#F05C2C", "LOW": "#4338CA"}.get(prio, "#4338CA")
-                st.markdown(
-                    f'<div style="background:white;border:1px solid var(--border);border-left:4px solid {color};'
-                    f'border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:8px;">'
-                    f'<span style="font-size:10px;font-weight:700;color:{color};text-transform:uppercase;">{prio}</span> '
-                    f'<strong style="color:#0F172A;">{rec.get("recommendation","")}</strong><br>'
-                    f'<span style="font-size:13px;color:#4B5563;">{rec.get("rationale","")}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-        risks = s.get("risks_and_mitigations", [])
-        if risks:
-            st.markdown("---")
-            st.markdown("**Risks & Mitigations**")
-            for r in risks:
-                st.markdown(f"- ⚠️ **{r.get('risk','')}** — {r.get('mitigation','')}")
-
-    # ── TAB 2: Channel Mix ────────────────────────────────────────────────────
-    with ms_t2:
-        channel_mix = s.get("channel_mix", [])
-        alloc       = s.get("budget_allocation", [])
-
-        if alloc:
-            alloc_df = pd.DataFrame(alloc)
-            c_chart, c_table = st.columns([2, 3])
-            with c_chart:
-                st.markdown("**Budget Allocation**")
-                chart_df = pd.DataFrame({
-                    "Channel": [a["channel"] for a in alloc],
-                    "Budget %": [a["pct"] for a in alloc],
-                }).set_index("Channel")
-                st.bar_chart(chart_df)
-            with c_table:
-                st.markdown("**Budget by Channel**")
-                st.dataframe(alloc_df, use_container_width=True, hide_index=True,
-                             column_config={"pct": st.column_config.NumberColumn("Budget %", format="%d%%")})
+        # Always 7-day window ending on the selected day
+        wm_start = wm_end - _wdelta(days=6)
+        wm_ss = wm_start.strftime("%Y-%m-%d")
+        wm_es = wm_end.strftime("%Y-%m-%d")
+        st.caption(f"{wm_ss} → {wm_es}  •  prev: {(wm_start - _wdelta(days=7)).strftime('%m/%d')} → {(wm_start - _wdelta(days=1)).strftime('%m/%d')}")
 
         st.markdown("---")
-        st.markdown("**Channel Detail**")
-        for ch in channel_mix:
-            with st.expander(f"**{ch.get('channel','')}**  —  {ch.get('budget_pct',0)}%  |  {ch.get('role','')}", expanded=False):
-                cc1, cc2 = st.columns(2)
-                with cc1:
-                    st.markdown(f"**Platforms:** {', '.join(ch.get('platforms',[]))}")
-                    st.markdown(f"**Formats:** {', '.join(ch.get('recommended_formats',[]))}")
-                    st.markdown(f"**KPIs:** {', '.join(ch.get('kpis',[]))}")
-                with cc2:
-                    st.markdown(f"**Past Performance:** {ch.get('past_performance','')}")
-                    st.markdown(f"**Market Benchmark:** {ch.get('market_benchmark','')}")
-                st.markdown(f"**Rationale:** {ch.get('rationale','')}")
+        wm_gen = st.button("🗓️ Generate Brief", type="primary", use_container_width=True)
+        if st.button("🗑️ Clear", use_container_width=True):
+            for k in ["wm_data", "wm_brief", "wm_client_key"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
-    # ── TAB 3: Flight Plan ────────────────────────────────────────────────────
-    with ms_t3:
-        flight = s.get("monthly_flight", [])
-        if flight:
-            weight_map   = {"Heavy": 3, "Medium": 2, "Light": 1, "Off": 0}
-            weight_color = {"Heavy": "🔴", "Medium": "🟡", "Light": "🟢", "Off": "⚫"}
-            flight_df = pd.DataFrame([{
-                "Month":    f.get("month", ""),
-                "Phase":    f.get("phase", ""),
-                "Weight":   f.get("relative_weight", ""),
-                "Channels": ", ".join(f.get("channels_active", [])) if isinstance(f.get("channels_active"), list) else str(f.get("channels_active", "")),
-                "Activity": f.get("activity", ""),
-            } for f in flight])
-
-            # Visual flight strip
-            st.markdown("**Activity Heatmap**")
-            cols_per_row = min(6, len(flight))
-            for row_start in range(0, len(flight), cols_per_row):
-                row_flights = flight[row_start:row_start + cols_per_row]
-                row_cols = st.columns(len(row_flights))
-                for col, f in zip(row_cols, row_flights):
-                    w = f.get("relative_weight", "Medium")
-                    bg = {"Heavy": "#FEE2E2", "Medium": "#FEF3C7", "Light": "#F0FDF4", "Off": "#F9FAFB"}.get(w, "#F9FAFB")
-                    fg = {"Heavy": "#991B1B", "Medium": "#92400E", "Light": "#166534", "Off": "#6B7280"}.get(w, "#374151")
-                    with col:
-                        st.markdown(
-                            f'<div style="background:{bg};border:1px solid #E5E7EB;border-radius:8px;padding:10px 8px;text-align:center;">'
-                            f'<div style="font-size:11px;font-weight:700;color:{fg};">{f.get("month","")}</div>'
-                            f'<div style="font-size:10px;color:{fg};margin-top:2px;">{w}</div>'
-                            f'<div style="font-size:9px;color:#6B7280;margin-top:3px;">{f.get("phase","")}</div>'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-
-            st.markdown("---")
-            st.markdown("**Flight Plan Detail**")
-            st.dataframe(flight_df, use_container_width=True, hide_index=True,
-                         column_config={"Activity": st.column_config.TextColumn(width="large")})
-
-    # ── TAB 4: Insights & Learnings ───────────────────────────────────────────
-    with ms_t4:
-        i1, i2 = st.columns(2)
-
-        with i1:
-            st.markdown("**📊 Market Insights from Portfolio**")
-            for ins in s.get("market_insights", []):
-                st.markdown(
-                    f'<div class="slide-card" style="margin-bottom:10px;">'
-                    f'<strong style="color:#0D0A2E;">{ins.get("insight","")}</strong>'
-                    f'<div class="so-what" style="margin-top:6px;">➔ {ins.get("implication","")}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-        with i2:
-            st.markdown("**🎓 Learnings from Past Campaigns**")
-            for lrn in s.get("past_campaign_learnings", []):
-                st.markdown(
-                    f'<div class="slide-card" style="margin-bottom:10px;">'
-                    f'<strong style="color:#0D0A2E;">{lrn.get("learning","")}</strong>'
-                    f'<div class="so-what" style="margin-top:6px;">Applied: {lrn.get("applied_as","")}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-    # ── TAB 5: Raw JSON ───────────────────────────────────────────────────────
-    with ms_t5:
-        st.json(s)
-
-# ═══════════════════════════════════════
-# MODE: CAMPAIGN PULSE
-# ═══════════════════════════════════════
-elif mode == "📊 Campaign Pulse":
-    from data_layer import get_live_clients as _glc, assemble_pca_data
-    MOCK_CLIENTS = _glc()
-
-    st.markdown("""<div class="main-header">
-        <h1>📊 Campaign Pulse</h1>
-        <p>Standardised performance scorecard — benchmarks CPM, CTR, CPC and creative effectiveness into a single quality signal</p>
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown(f"""<div class="main-header">
+        <h1>📅 Weekly Meet</h1>
+        <p>{wm_client}  •  {wm_ss} → {wm_es}  •  WIP meeting brief</p>
     </div>""", unsafe_allow_html=True)
 
-    with st.sidebar:
-        st.markdown("##### Client & Campaign")
-        cp_clients = list(MOCK_CLIENTS.keys())
-        cp_ci = st.selectbox("Client", cp_clients, format_func=lambda x: MOCK_CLIENTS[x]["name"], key="cp_client")
-        cp_camps = list(MOCK_CLIENTS[cp_ci]["campaigns"].keys())
-        cp_camp  = st.selectbox("Campaign", cp_camps, format_func=lambda x: MOCK_CLIENTS[cp_ci]["campaigns"][x]["name"], key="cp_camp")
-        cp_meta  = MOCK_CLIENTS[cp_ci]["campaigns"][cp_camp]
-        st.markdown("##### Date Range")
-        cp_c1, cp_c2 = st.columns(2)
-        with cp_c1: cp_sd = st.date_input("Start", value=date.fromisoformat(cp_meta["start"]), key="cp_sd")
-        with cp_c2: cp_ed = st.date_input("End",   value=date.fromisoformat(cp_meta["end"]),   key="cp_ed")
-        cp_gen = st.button("📊 Score Campaign", type="primary", use_container_width=True)
+    _wm_key = (wm_client, wm_ss, wm_es)
 
-    _cp_key = (cp_ci, cp_camp, str(cp_sd), str(cp_ed))
-    if cp_gen or ("cp_result" in st.session_state and st.session_state.get("_cp_key") == _cp_key):
-        if cp_gen or "cp_result" not in st.session_state:
-            with st.spinner("Scoring campaign…"):
-                cp_result = score_campaign(cp_ci, cp_camp, str(cp_sd), str(cp_ed))
-            st.session_state["cp_result"] = cp_result
-            st.session_state["_cp_key"]   = _cp_key
+    if wm_gen:
+        if st.session_state.get("wm_client_key") == _wm_key and "wm_brief" in st.session_state:
+            st.toast("Same parameters — showing cached brief.", icon="💾")
+        else:
+            st.session_state.pop("wm_data",  None)
+            st.session_state.pop("wm_brief", None)
 
-    if "cp_result" not in st.session_state:
-        st.info("Select a client and campaign, then click **Score Campaign**.")
+            with st.spinner("Pulling weekly data from BigQuery…"):
+                _wm_raw = get_weekly_meet_data(wm_client, wm_ss, wm_es)
+            st.session_state["wm_data"] = _wm_raw
+
+            with st.spinner("Generating meeting brief with Gemini…"):
+                _wm_brief = generate_weekly_meet(_wm_raw, wm_client)
+            st.session_state["wm_brief"]      = _wm_brief
+            st.session_state["wm_client_key"] = _wm_key
+
+    # ── Empty state ───────────────────────────────────────────────────────────
+    if "wm_brief" not in st.session_state:
+        wm_e1, wm_e2, wm_e3 = st.columns(3)
+        for _col, (_ico, _h, _b) in zip(
+            [wm_e1, wm_e2, wm_e3],
+            [
+                ("📊", "Per-channel summary", "Spend, CPM, CTR, impressions — with WoW commentary for each platform."),
+                ("🎯", "Next week actions", "Specific, prioritised recommendations your planner can act on immediately."),
+                ("💬", "Client talking points", "The questions your client will ask — answered before they ask them."),
+            ]
+        ):
+            with _col:
+                st.markdown(
+                    f'<div class="kpi-card" style="text-align:center;">'
+                    f'<div style="font-size:28px;margin-bottom:8px;">{_ico}</div>'
+                    f'<div class="kpi-label">{_h}</div>'
+                    f'<div style="font-size:12px;color:var(--text-2);margin-top:6px;">{_b}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+        st.markdown("<div style='margin-top:24px;text-align:center;color:var(--text-3);font-size:13px;'>Select a client and week, then click <strong>Generate Brief</strong></div>", unsafe_allow_html=True)
         st.stop()
 
-    r = st.session_state["cp_result"]
-    score = r["composite"]
-    grade = r["grade"]
+    # ── Render brief ──────────────────────────────────────────────────────────
+    _wm_d = st.session_state["wm_data"]
+    _wm_b = st.session_state["wm_brief"]
+    _tot  = _wm_d.get("totals", {})
 
-    # ── Score colour ─────────────────────────────────────────────────────────
-    def _score_color(s):
-        if s >= 80: return "#10B981"
-        if s >= 65: return "#F59E0B"
-        return "#EF4444"
+    if _wm_b.get("_error"):
+        st.error(f"LLM error — showing rule-based summary. **{_wm_b.get('_error_msg','')}**")
 
-    # ── KPI bar ──────────────────────────────────────────────────────────────
-    kp1, kp2, kp3, kp4, kp5 = st.columns(5)
-    for col, (lbl, val, sub) in zip([kp1,kp2,kp3,kp4,kp5], [
-        ("Pulse Score",   f'<span style="color:{_score_color(score)};font-size:2rem;font-weight:800;">{score}</span><span style="font-size:1rem;color:#6B7280;">/100</span>', r["campaign"]),
-        ("Grade",         f'<span style="color:{_score_color(score)};font-size:2rem;font-weight:800;">{grade}</span>', "composite letter grade"),
-        ("Platforms",     str(r["n_platforms"]), "in scoring period"),
-        ("Total Spend",   f'${r["total_spend"]:,.0f}', "across all channels"),
-        ("Period",        r["period"].replace(" – ", " →"), "campaign flight"),
-    ]):
-        with col:
-            st.markdown(f'<div class="kpi-card"><div class="kpi-label">{lbl}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
+    # ── Headline banner ───────────────────────────────────────────────────────
+    _headline = _wm_b.get("headline", "")
+    if _headline:
+        st.markdown(
+            f'<div style="background:var(--navy);color:#fff;padding:16px 24px;border-radius:var(--r-md);'
+            f'font-size:18px;font-weight:700;letter-spacing:-0.3px;margin-bottom:16px;">'
+            f'📋 {_headline}</div>',
+            unsafe_allow_html=True
+        )
 
-    st.markdown("---")
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    _spend     = _tot.get("spend", 0)
+    _imps      = _tot.get("impressions", 0)
+    _cpm       = _tot.get("cpm")
+    _ctr       = _tot.get("ctr")
+    _wow_spend = _tot.get("spend_wow_pct")
+    _lw_spend  = _tot.get("lw_spend", 0)
+    _n_plats   = _tot.get("n_platforms", 0)
+    _llm_cost  = _wm_b.get("_metadata", {}).get("cost", 0.0)
 
-    # ── Sub-score bars ────────────────────────────────────────────────────────
-    st.markdown("#### Performance Dimensions")
-    metric_labels = {"CPM": "CPM Efficiency", "CTR": "CTR Performance", "CPC": "CPC Efficiency",
-                     "CPCV": "CPCV Efficiency", "Channel Mix": "Channel Mix Breadth", "Creative Diversity": "Creative Diversity"}
-    metric_icons  = {"CPM": "💰", "CTR": "👆", "CPC": "🖱️", "CPCV": "▶️", "Channel Mix": "📡", "Creative Diversity": "🎨"}
-    scores_dict   = r.get("scores", {})
+    def _wow_badge(val, lower_better=False):
+        if val is None: return ""
+        good = (val < 0) if lower_better else (val > 0)
+        colour = "var(--green)" if good else "var(--red)"
+        arrow  = "▲" if val > 0 else "▼"
+        return (f'<span style="font-size:10px;font-weight:700;color:{colour};'
+                f'background:{"var(--green-bg)" if good else "var(--red-bg)"};'
+                f'padding:2px 6px;border-radius:4px;margin-left:4px;">{arrow} {abs(val):.1f}%</span>')
 
-    dim_cols = st.columns(3)
-    for i, (mk, mlabel) in enumerate(metric_labels.items()):
-        sv = scores_dict.get(mk, 50)
-        sc = _score_color(sv)
-        bar_pct = sv
-        with dim_cols[i % 3]:
+    wm_k1, wm_k2, wm_k3, wm_k4, wm_k5 = st.columns(5)
+    for _col, (_lbl, _val, _sub) in zip(
+        [wm_k1, wm_k2, wm_k3, wm_k4, wm_k5],
+        [
+            ("Total Spend",   f"${_spend:,.0f}" + _wow_badge(_wow_spend), f"vs ${_lw_spend:,.0f} last week"),
+            ("Impressions",   f"{_imps:,.0f}",     f"CPM ${_cpm:.2f}" if _cpm else ""),
+            ("CTR",           f"{_ctr:.3f}%" if _ctr else "—", "click-through rate"),
+            ("Platforms",     str(_n_plats), f"{wm_ss} → {wm_es}"),
+            ("Generation Cost", f"${_llm_cost:.4f}", "Gemini · Vertex AI"),
+        ]
+    ):
+        with _col:
             st.markdown(
-                f'<div class="slide-card" style="padding:16px;">'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
-                f'<span style="font-size:13px;font-weight:600;color:#374151;">{metric_icons.get(mk,"📊")} {mlabel}</span>'
-                f'<span style="font-size:18px;font-weight:800;color:{sc};">{sv}</span>'
-                f'</div>'
-                f'<div style="background:#F3F4F6;border-radius:4px;height:8px;">'
-                f'<div style="background:{sc};border-radius:4px;height:8px;width:{bar_pct}%;transition:width 0.4s;"></div>'
-                f'</div>'
-                f'</div>', unsafe_allow_html=True
+                f'<div class="kpi-card"><div class="kpi-label">{_lbl}</div>'
+                f'<div class="kpi-value">{_val}</div>'
+                f'<div class="kpi-sub">{_sub}</div></div>',
+                unsafe_allow_html=True
             )
 
     st.markdown("---")
 
-    # ── Platform scores table ─────────────────────────────────────────────────
-    st.markdown("#### Platform Breakdown")
-    ps = r.get("platform_scores", [])
-    if ps:
-        ps_df = pd.DataFrame(ps)
-        ps_df["score_bar"] = ps_df["score"].apply(lambda s: f'{"█" * (s//10)}{"░" * (10 - s//10)} {s}')
-        ps_df["spend_fmt"] = ps_df["spend"].apply(lambda x: f"${x:,.0f}")
-        ps_df["share_fmt"] = ps_df["spend_share"].apply(lambda x: f"{x:.1f}%")
-        ps_df["cpm_fmt"]   = ps_df["cpm"].apply(lambda x: f"${x:.2f}" if x else "—")
-        ps_df["ctr_fmt"]   = ps_df["ctr"].apply(lambda x: f"{x:.3f}%" if x else "—")
-        st.dataframe(
-            ps_df[["platform","channel_type","score","spend_fmt","share_fmt","cpm_fmt","ctr_fmt"]].rename(columns={
-                "platform":"Platform","channel_type":"Channel","score":"Score",
-                "spend_fmt":"Spend","share_fmt":"Share","cpm_fmt":"CPM","ctr_fmt":"CTR"
-            }),
-            hide_index=True, use_container_width=True,
-            column_config={"Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d")}
-        )
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    wm_t1, wm_t2, wm_t3, wm_t4, wm_t5 = st.tabs(["📊 Channel Summaries", "📋 Campaign Summary", "🎯 Next Week Actions", "💬 Talking Points", "🔢 Raw Data"])
 
-    # ── Score interpretation ──────────────────────────────────────────────────
-    st.markdown("---")
-    interp_col1, interp_col2 = st.columns(2)
-    with interp_col1:
-        st.markdown("#### Score Guide")
-        for band, label, col in [("90–100","A+ · Exceptional","#10B981"),("80–89","A · Strong","#34D399"),
-                                   ("65–79","B · Solid","#F59E0B"),("45–64","C · Needs attention","#F97316"),("0–44","D · Underperforming","#EF4444")]:
-            st.markdown(f'<div style="display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid #F3F4F6;">'
-                        f'<span style="font-size:13px;font-weight:700;color:{col};min-width:60px;">{band}</span>'
-                        f'<span style="font-size:13px;color:#374151;">{label}</span></div>', unsafe_allow_html=True)
-    with interp_col2:
-        st.markdown("#### Methodology")
-        st.markdown("""
-        Scores are computed by comparing each platform's actual CPM, CTR, CPC, and CPCV against the
-        portfolio benchmark for that platform category.
+    # ── TAB 1: Channel Summaries ───────────────────────────────────────────────
+    with wm_t1:
+        _overall = _wm_b.get("overall_summary", "")
+        if _overall:
+            st.markdown(
+                f'<div style="background:var(--purple-bg);border-left:3px solid var(--purple);'
+                f'padding:14px 18px;border-radius:0 var(--r-sm) var(--r-sm) 0;margin-bottom:20px;'
+                f'font-size:14px;line-height:1.7;color:var(--text-1);">'
+                f'<strong>Overall</strong> — {_overall}</div>',
+                unsafe_allow_html=True
+            )
 
-        | Weight | Metric |
-        |--------|--------|
-        | 25% | CPM Efficiency |
-        | 25% | CTR Performance |
-        | 20% | CPC Efficiency |
-        | 15% | CPCV Efficiency |
-        | 10% | Channel Mix Breadth |
-        | 5%  | Creative Diversity |
+        # Build WoW map for badge display
+        _wow_map = {w["platform"]: w for w in _wm_d.get("wow", [])}
 
-        Scores above 65 indicate a campaign performing at or above benchmark.
-        """)
+        _status_cfg = {
+            "strong":   ("#ECFDF5", "#059669", "✅ STRONG"),
+            "on_track": ("#EEF2FF", "#4338CA", "🟦 ON TRACK"),
+            "watch":    ("#FFFBEB", "#D97706", "⚠️ WATCH"),
+            "concern":  ("#FEF2F2", "#DC2626", "🔴 CONCERN"),
+        }
 
+        channels = _wm_b.get("channels", [])
 
-# ═══════════════════════════════════════
-# MODE: PACERLY
-# ═══════════════════════════════════════
-elif mode == "⏱️ Pacerly":
-    from data_layer import get_live_clients as _glc
-    MOCK_CLIENTS = _glc()
+        # Two-column grid
+        _left_cols = channels[::2]
+        _right_cols = channels[1::2]
 
-    st.markdown("""<div class="main-header">
-        <h1>⏱️ Pacerly</h1>
-        <p>AI-assisted budget pacing — track spend vs plan, flag over/under-delivery, and get bid adjustment guidance in seconds</p>
-    </div>""", unsafe_allow_html=True)
+        for _pair in zip(_left_cols, _right_cols + [None]):
+            _col_a, _col_b = st.columns(2)
+            for _col_widget, _ch in [(_col_a, _pair[0]), (_col_b, _pair[1])]:
+                if _ch is None:
+                    continue
+                with _col_widget:
+                    _pl       = _ch.get("platform", "")
+                    _status   = _ch.get("status", "on_track")
+                    _bg, _clr, _slbl = _status_cfg.get(_status, _status_cfg["on_track"])
+                    _summary  = _ch.get("summary", "")
+                    _wow_note = _ch.get("wow_note", "")
+                    _rec      = _ch.get("recommendation", "")
 
-    with st.sidebar:
-        st.markdown("##### Client & Campaign")
-        pac_clients = list(MOCK_CLIENTS.keys())
-        pac_ci   = st.selectbox("Client", pac_clients, format_func=lambda x: MOCK_CLIENTS[x]["name"], key="pac_client")
-        pac_camps = list(MOCK_CLIENTS[pac_ci]["campaigns"].keys())
-        pac_camp  = st.selectbox("Campaign", pac_camps, format_func=lambda x: MOCK_CLIENTS[pac_ci]["campaigns"][x]["name"], key="pac_camp")
-        pac_meta  = MOCK_CLIENTS[pac_ci]["campaigns"][pac_camp]
-        st.markdown("##### Date Range")
-        pac_c1, pac_c2 = st.columns(2)
-        with pac_c1: pac_sd = st.date_input("Start", value=date.fromisoformat(pac_meta["start"]), key="pac_sd")
-        with pac_c2: pac_ed = st.date_input("End",   value=date.fromisoformat(pac_meta["end"]),   key="pac_ed")
-        pac_gen = st.button("⏱️ Check Pacing", type="primary", use_container_width=True)
+                    # Find this platform in this_week data for numbers
+                    _tw = next((r for r in _wm_d.get("this_week", []) if r["platform"] == _pl), {})
+                    _sp   = _tw.get("spend", 0)
+                    _cpm_ = _tw.get("cpm")
+                    _ctr_ = _tw.get("ctr")
+                    _imps_= _tw.get("impressions", 0)
 
-    _pac_key = (pac_ci, pac_camp, str(pac_sd), str(pac_ed))
-    if pac_gen or ("pac_result" in st.session_state and st.session_state.get("_pac_key") == _pac_key):
-        if pac_gen or "pac_result" not in st.session_state:
-            with st.spinner("Computing pacing…"):
-                pac_result = get_pacing_data(pac_ci, pac_camp, str(pac_sd), str(pac_ed))
-            st.session_state["pac_result"] = pac_result
-            st.session_state["_pac_key"]   = _pac_key
+                    _metrics_html = (
+                        f'<span style="font-size:11px;color:var(--text-2);margin-right:12px;">💰 ${_sp:,.0f}</span>'
+                        f'<span style="font-size:11px;color:var(--text-2);margin-right:12px;">'
+                        f'{"CPM $"+str(_cpm_) if _cpm_ else ""}</span>'
+                        f'<span style="font-size:11px;color:var(--text-2);">'
+                        f'{"CTR "+str(_ctr_)+"%" if _ctr_ else ""}</span>'
+                    )
 
-    if "pac_result" not in st.session_state:
-        st.info("Select a client and campaign, then click **Check Pacing**.")
-        st.stop()
-
-    p = st.session_state["pac_result"]
-    status_colors = {"ON TRACK": "#10B981", "AHEAD": "#EF4444", "BEHIND": "#F59E0B"}
-    sc = status_colors.get(p["status"], "#6B7280")
-
-    # ── KPI bar ──────────────────────────────────────────────────────────────
-    pk1, pk2, pk3, pk4, pk5 = st.columns(5)
-    for col, (lbl, val, sub) in zip([pk1,pk2,pk3,pk4,pk5], [
-        ("Pacing Status", f'<span style="color:{sc};font-size:1.4rem;font-weight:800;">{p["status_icon"]} {p["status"]}</span>', p["campaign"]),
-        ("Budget",        f'${p["planned_spend"]:,.0f}', "total planned"),
-        ("Spent",         f'${p["actual_spend"]:,.0f}', f'{p["spent_pct"]:.1f}% of budget'),
-        ("Flight Elapsed",f'{p["elapsed_pct"]:.1f}%',  "of campaign period"),
-        ("Pacing Index",  f'{p["pacing_index"]:.2f}x',  "spent ÷ elapsed (1.0 = on track)"),
-    ]):
-        with col:
-            st.markdown(f'<div class="kpi-card"><div class="kpi-label">{lbl}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Pacing chart ─────────────────────────────────────────────────────────
-    import plotly.graph_objects as go
-
-    timeline = p.get("timeline", [])
-    weeks        = [t["week"] for t in timeline]
-    cum_planned  = [t["cum_planned"] for t in timeline]
-    cum_actual   = [t["cum_actual"] if t["cum_actual"] is not None else None for t in timeline]
-    actual_pts   = [(w, a) for w, a in zip(weeks, cum_actual) if a is not None]
-
-    fig_pac = go.Figure()
-    fig_pac.add_trace(go.Scatter(x=weeks, y=cum_planned, name="Planned (cumulative)",
-                                  line=dict(color="#6366F1", width=2, dash="dash"), mode="lines"))
-    if actual_pts:
-        aw, aa = zip(*actual_pts)
-        fig_pac.add_trace(go.Scatter(x=list(aw), y=list(aa), name="Actual (cumulative)",
-                                      line=dict(color=sc, width=3), mode="lines+markers",
-                                      marker=dict(size=5)))
-    fig_pac.update_layout(
-        title="Cumulative Spend vs Plan", height=320, margin=dict(l=0,r=0,t=40,b=0),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showgrid=False, tickfont=dict(size=10)),
-        yaxis=dict(showgrid=True, gridcolor="#F3F4F6", tickprefix="$", tickformat=",.0f"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        font=dict(family="Inter, sans-serif", size=12)
-    )
-    st.plotly_chart(fig_pac, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Platform pacing table ─────────────────────────────────────────────────
-    st.markdown("#### Platform Pacing")
-    plat_pac = p.get("platform_pacing", [])
-    if plat_pac:
-        status_icons = {"Ahead": "🔴", "On Track": "🟢", "Behind": "🟡"}
-        rows = []
-        for pp in plat_pac:
-            rows.append({
-                "Platform":   pp["platform"],
-                "Channel":    pp["channel_type"],
-                "Planned":    f'${pp["planned"]:,.0f}',
-                "Spent":      f'${pp["actual"]:,.0f}',
-                "Pacing":     pp["pacing_pct"],
-                "Status":     f'{status_icons.get(pp["status"], "")} {pp["status"]}',
-                "Recommended Action": pp["action"],
-            })
-        pp_df = pd.DataFrame(rows)
-        st.dataframe(
-            pp_df, hide_index=True, use_container_width=True,
-            column_config={"Pacing": st.column_config.ProgressColumn("Pacing %", min_value=0, max_value=150, format="%.0f%%")}
-        )
-
-    # ── Pacing advice ─────────────────────────────────────────────────────────
-    st.markdown("---")
-    ahead_plats  = [pp for pp in plat_pac if pp["status"] == "Ahead"]
-    behind_plats = [pp for pp in plat_pac if pp["status"] == "Behind"]
-
-    adv1, adv2 = st.columns(2)
-    with adv1:
-        if ahead_plats:
-            st.markdown("#### 🔴 Over-Delivering Platforms")
-            for pp in ahead_plats[:4]:
-                st.markdown(
-                    f'<div class="slide-card" style="padding:14px;margin-bottom:8px;">'
-                    f'<strong>{pp["platform"]}</strong> — {pp["pacing_pct"]:.0f}% paced<br>'
-                    f'<span style="color:#6B7280;font-size:12px;">{pp["action"]}</span>'
-                    f'</div>', unsafe_allow_html=True)
-        else:
-            st.success("No platforms over-delivering.")
-    with adv2:
-        if behind_plats:
-            st.markdown("#### 🟡 Under-Delivering Platforms")
-            for pp in behind_plats[:4]:
-                st.markdown(
-                    f'<div class="slide-card" style="padding:14px;margin-bottom:8px;">'
-                    f'<strong>{pp["platform"]}</strong> — {pp["pacing_pct"]:.0f}% paced<br>'
-                    f'<span style="color:#6B7280;font-size:12px;">{pp["action"]}</span>'
-                    f'</div>', unsafe_allow_html=True)
-        else:
-            st.success("No platforms under-delivering.")
-
-
-# ═══════════════════════════════════════
-# MODE: OPTIMIZER BUDDY
-# ═══════════════════════════════════════
-elif mode == "🤖 Optimizer Buddy":
-    from data_layer import get_live_clients as _ob_glc, assemble_pca_data
-    MOCK_CLIENTS = _ob_glc()
-    from llm_engine import generate_optimizations
-
-    st.markdown("""<div class="main-header">
-        <h1>🤖 Optimizer Buddy</h1>
-        <p>AI-powered optimization advisor — ingests campaign performance and surfaces specific, actionable recommendations with confidence scores</p>
-    </div>""", unsafe_allow_html=True)
-
-    with st.sidebar:
-        st.markdown("##### Client & Campaign")
-        ob_clients = list(MOCK_CLIENTS.keys())
-        ob_ci   = st.selectbox("Client", ob_clients, format_func=lambda x: MOCK_CLIENTS[x]["name"], key="ob_client")
-        ob_camps = list(MOCK_CLIENTS[ob_ci]["campaigns"].keys())
-        ob_camp  = st.selectbox("Campaign", ob_camps, format_func=lambda x: MOCK_CLIENTS[ob_ci]["campaigns"][x]["name"], key="ob_camp")
-        ob_meta  = MOCK_CLIENTS[ob_ci]["campaigns"][ob_camp]
-        st.markdown("##### Date Range")
-        ob_c1, ob_c2 = st.columns(2)
-        with ob_c1: ob_sd = st.date_input("Start", value=date.fromisoformat(ob_meta["start"]), key="ob_sd")
-        with ob_c2: ob_ed = st.date_input("End",   value=date.fromisoformat(ob_meta["end"]),   key="ob_ed")
-        st.markdown("##### Focus")
-        ob_focus = st.selectbox("Optimise for", ["Overall efficiency","Reduce CPM","Improve CTR","Reduce CPC","Maximise reach"], key="ob_focus")
-        ob_gen = st.button("🤖 Get Recommendations", type="primary", use_container_width=True)
-
-    _ob_key = (ob_ci, ob_camp, str(ob_sd), str(ob_ed), ob_focus)
-    if ob_gen or ("ob_result" in st.session_state and st.session_state.get("_ob_key") == _ob_key):
-        if ob_gen or "ob_result" not in st.session_state:
-            with st.spinner("Analysing campaign and generating recommendations…"):
-                ob_data = assemble_pca_data(ob_ci, ob_camp, str(ob_sd), str(ob_ed))
-                ob_data["focus"] = ob_focus
-                ob_result = generate_optimizations(ob_data)
-            st.session_state["ob_result"] = ob_result
-            st.session_state["_ob_key"]   = _ob_key
-
-    if "ob_result" not in st.session_state:
-        st.info("Select a campaign and click **Get Recommendations**.")
-        st.stop()
-
-    ob_res  = st.session_state["ob_result"]
-    ob_opts = ob_res.get("optimizations", [])
-
-    if ob_res.get("error"):
-        st.error(f"LLM error — showing mock recommendations. {ob_res['error']}")
-
-    # ── Summary bar ───────────────────────────────────────────────────────────
-    high_conf = [o for o in ob_opts if o.get("confidence", 0) >= 0.80]
-    ob_k1, ob_k2, ob_k3 = st.columns(3)
-    for col, (lbl, val, sub) in zip([ob_k1, ob_k2, ob_k3], [
-        ("Recommendations", str(len(ob_opts)),      "identified by AI"),
-        ("High Confidence", str(len(high_conf)),    "≥80% confidence"),
-        ("Optimising For",  ob_focus.split(" ")[0], ob_focus),
-    ]):
-        with col:
-            st.markdown(f'<div class="kpi-card"><div class="kpi-label">{lbl}</div><div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Recommendation cards ──────────────────────────────────────────────────
-    if not ob_opts:
-        st.info("No optimizations returned. Try enabling the LLM in the sidebar settings.")
-    else:
-        st.markdown(f"#### {len(ob_opts)} Optimization Recommendations")
-        for i, opt in enumerate(ob_opts, start=1):
-            conf      = opt.get("confidence", 0.75)
-            conf_pct  = int(conf * 100)
-            if conf_pct >= 80: conf_color = "#10B981"
-            elif conf_pct >= 60: conf_color = "#F59E0B"
-            else: conf_color = "#EF4444"
-
-            with st.container():
-                oc1, oc2 = st.columns([5, 1])
-                with oc1:
+                    _wow_html = (
+                        '<div style="font-size:12px;color:var(--text-2);font-style:italic;margin-bottom:8px;">📈 '
+                        + _wow_note + '</div>'
+                    ) if _wow_note else ""
+                    _rec_html = (
+                        '<div style="background:var(--navy);color:#fff;border-radius:6px;'
+                        'padding:8px 12px;font-size:12px;font-weight:500;">→ '
+                        + _rec + '</div>'
+                    ) if _rec else ""
                     st.markdown(
-                        f'<div class="slide-card" style="padding:18px;margin-bottom:12px;">'
-                        f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">'
-                        f'<div>'
-                        f'<span style="background:#EEF2FF;color:#4F46E5;font-size:11px;font-weight:700;padding:2px 8px;border-radius:12px;">#{i} · {opt.get("platform","General")}</span>'
-                        f'<h4 style="margin:8px 0 4px;color:#0D0A2E;">{opt.get("action","")}</h4>'
+                        f'<div style="background:{_bg};border:1px solid {_clr}33;border-radius:var(--r-md);'
+                        f'padding:16px;margin-bottom:12px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+                        f'<strong style="font-size:15px;color:var(--text-1);">{_pl}</strong>'
+                        f'<span style="font-size:10px;font-weight:700;color:{_clr};background:{_clr}18;'
+                        f'padding:3px 8px;border-radius:4px;">{_slbl}</span>'
                         f'</div>'
-                        f'<div style="text-align:right;min-width:80px;">'
-                        f'<div style="font-size:22px;font-weight:800;color:{conf_color};">{conf_pct}%</div>'
-                        f'<div style="font-size:10px;color:#6B7280;">confidence</div>'
-                        f'</div>'
-                        f'</div>'
-                        f'<div style="margin-bottom:8px;">'
-                        f'<span style="font-size:12px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:0.05em;">Rationale</span><br>'
-                        f'<span style="font-size:13px;color:#374151;">{opt.get("rationale","")}</span>'
-                        f'</div>'
-                        f'<div style="background:#F0FDF4;border-left:3px solid #10B981;padding:8px 12px;border-radius:0 6px 6px 0;">'
-                        f'<span style="font-size:12px;font-weight:600;color:#065F46;">Expected impact: </span>'
-                        f'<span style="font-size:12px;color:#065F46;">{opt.get("expected_impact","")}</span>'
-                        f'</div>'
-                        f'<div style="margin-top:10px;background:#F3F4F6;border-radius:4px;height:6px;">'
-                        f'<div style="background:{conf_color};border-radius:4px;height:6px;width:{conf_pct}%;"></div>'
-                        f'</div>'
+                        f'<div style="margin-bottom:8px;">{_metrics_html}</div>'
+                        f'<div style="font-size:13px;color:var(--text-1);line-height:1.65;margin-bottom:8px;">{_summary}</div>'
+                        f'{_wow_html}{_rec_html}'
                         f'</div>',
                         unsafe_allow_html=True
                     )
-# ═══════════════════════════════════════════════════════════════════════════
-# 🏷️ TAXONOMY COMPLIANCE
-# ═══════════════════════════════════════════════════════════════════════════
-elif mode == "🏷️ Taxonomy Compliance":
-    import json, os, glob as _glob
 
-    # ── Locate the Excel source of truth ──────────────────────────────────────
-    # Look in Downloads folder first, then same dir as app.py
-    _candidates = (
-        _glob.glob(os.path.expanduser("~/Downloads/paid_media_2026_ytd.xlsx"))
-        + _glob.glob(os.path.join(os.path.dirname(__file__), "paid_media_2026_ytd.xlsx"))
-        + _glob.glob(os.path.join(os.path.dirname(__file__), "data", "paid_media_2026_ytd.xlsx"))
-    )
-    EXCEL_PATH = _candidates[0] if _candidates else None
-
-    st.markdown("""<div class="main-header">
-        <h1>🏷️ Taxonomy Compliance</h1>
-        <p>Campaign naming convention auditor — spot gaps, fix the worst offenders first, climb the leaderboard</p>
-    </div>""", unsafe_allow_html=True)
-
-    # ── Load taxonomy from pkl (fast, has all fields) ────────────────────────
-    _PKL_PATH = os.path.join(os.path.dirname(__file__), "data", "taxonomy_compliance.pkl")
-
-    @st.cache_data(show_spinner=False)
-    def _load_taxonomy_db(_pkl):
-        import pickle
-        with open(_pkl, "rb") as f:
-            raw = pickle.load(f)
-        # Normalise column names
-        if "missing_required" in raw.columns and "missing_fields" not in raw.columns:
-            raw = raw.rename(columns={"missing_required": "missing_fields"})
-        # Ensure compliance_score is 0-1 float (pkl stores as 0-1)
-        raw["compliance_score"] = pd.to_numeric(raw["compliance_score"], errors="coerce").fillna(0)
-        # Ensure matched_fields exists (JSON string of {field: value} dict)
-        if "matched_fields" not in raw.columns:
-            tax_fields = ["Geography", "Media Type", "Ad Format", "Objective",
-                          "Demo Targeting", "Tactic / Audience"]
-            raw["matched_fields"] = raw.apply(
-                lambda r: json.dumps({f: r[f] for f in tax_fields
-                                      if f in raw.columns and pd.notna(r.get(f)) and str(r.get(f,"")).strip()}),
-                axis=1,
+        # Daily spend trend chart
+        _dd = _wm_d.get("daily_trend", [])
+        if _dd:
+            st.markdown("##### Daily Spend Trend")
+            _dd_df = pd.DataFrame(_dd)
+            _fig_daily = _wpx.bar(
+                _dd_df, x="day", y="spend", color="platform",
+                labels={"spend": "Spend ($)", "day": "Day", "platform": "Platform"},
+                color_discrete_sequence=["#4338CA","#F05C2C","#059669","#D97706","#6D63E8","#94A3B8","#0C0A28","#FC8181"],
+                template="plotly_white",
             )
-        for col in ["spend", "impressions", "clicks", "conversions"]:
-            if col in raw.columns:
-                raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0)
-        return raw
+            _fig_daily.update_layout(
+                height=280, margin=dict(l=0, r=0, t=20, b=0),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                xaxis=dict(gridcolor="#F0F2F6"), yaxis=dict(gridcolor="#F0F2F6"),
+            )
+            st.plotly_chart(_fig_daily, use_container_width=True)
 
-    if not os.path.exists(_PKL_PATH):
-        if not EXCEL_PATH:
-            st.warning("⚠️ Taxonomy data not found. Run `python3 data/build_taxonomy_db.py` first.")
+    # ── TAB 2: Campaign Summary ────────────────────────────────────────────────
+    with wm_t2:
+        _camps_tw = _wm_d.get("campaigns_this_week", [])
+        _camp_llm  = _wm_b.get("campaign_summaries", [])
+        _camp_llm_map = {c.get("campaign", ""): c for c in _camp_llm}
+
+        if not _camps_tw:
+            st.info("No campaign data found for this week.")
         else:
-            st.warning("⚠️ taxonomy_compliance.pkl not found. Run `python3 data/build_taxonomy_db.py` first.")
-        st.stop()
-
-    with st.spinner("Loading taxonomy database…"):
-        df = _load_taxonomy_db(_PKL_PATH)
-
-    ALL_CLIENTS = sorted(df["client"].unique().tolist())
-    CLIENT_COLORS = {
-        "Coles":   "#C00000", "RACV": "#0070C0", "Hanes": "#7030A0",
-        "Mazda":   "#ED7D31", "Simplot": "#375623",
-    }
-    REQUIRED_FIELDS = ["Geography", "Media Type", "Objective", "Demo Targeting", "Tactic / Audience"]
-
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("##### Client Filter")
-        sel_client = st.selectbox("View client", ["All Clients"] + ALL_CLIENTS, key="tax_client")
-        st.markdown("##### Platform Filter")
-        all_platforms = sorted(df["platform"].unique().tolist())
-        sel_platform = st.multiselect("Platforms", all_platforms, default=all_platforms, key="tax_platform")
-        st.markdown("##### Show Issues")
-        show_only = st.radio("Rows to show", ["All", "Issues only (≤ Partial)"], index=1, key="tax_show")
-        st.markdown("---")
-        st.caption("Source of truth: paid_media_2026_ytd.xlsx  \nTaxonomy sheet updated offline via build_taxonomy_db.py")
-
-    # ── Filter working df ─────────────────────────────────────────────────────
-    wdf = df[df["platform"].isin(sel_platform)].copy() if sel_platform else df.copy()
-    view_df = wdf[wdf["client"] == sel_client].copy() if sel_client != "All Clients" else wdf.copy()
-
-    # ── Build per-client summary ──────────────────────────────────────────────
-    def client_stats(cdf):
-        total = len(cdf)
-        if total == 0:
-            return {"total": 0, "compliant": 0, "partial": 0, "non": 0, "pct": 0.0, "spend_at_risk": 0.0}
-        compliant = (cdf["compliance_score"] >= 0.85).sum()
-        partial   = ((cdf["compliance_score"] >= 0.60) & (cdf["compliance_score"] < 0.85)).sum()
-        non       = (cdf["compliance_score"] < 0.60).sum()
-        passing   = compliant + partial
-        spend_at_risk = cdf.loc[cdf["compliance_score"] < 0.60, "spend"].sum()
-        return {
-            "total": total, "compliant": compliant, "partial": partial, "non": non,
-            "pct": passing / total * 100, "spend_at_risk": spend_at_risk,
-        }
-
-    client_summary = {c: client_stats(wdf[wdf["client"] == c]) for c in ALL_CLIENTS}
-    overall_stats  = client_stats(wdf)
-
-    # ── SECTION 1: Leaderboard ────────────────────────────────────────────────
-    st.markdown("### 🏆 Leaderboard")
-    ranked = sorted(ALL_CLIENTS, key=lambda c: client_summary[c]["pct"], reverse=True)
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
-
-    lb_cols = st.columns([1, 2, 2, 2, 2, 2])
-    for i, client in enumerate(ranked):
-        s   = client_summary[client]
-        pct = s["pct"]
-        bar_color = CLIENT_COLORS.get(client, "#6366F1")
-        bar_w     = int(pct)
-        badge_bg  = "#ECFDF5" if pct >= 85 else "#FFFBEB" if pct >= 60 else "#FEF2F2"
-        badge_col = "#059669" if pct >= 85 else "#D97706" if pct >= 60 else "#DC2626"
-
-        st.markdown(
-            f"""<div style="background:#fff;border:1px solid #E3E6ED;border-radius:10px;
-                padding:14px 18px;margin-bottom:8px;display:flex;align-items:center;gap:14px;">
-                <div style="font-size:22px;min-width:32px;">{medals[i]}</div>
-                <div style="min-width:90px;font-weight:700;font-size:14px;color:#0F172A;">{client}</div>
-                <div style="flex:1;background:#F1F5F9;border-radius:6px;height:10px;overflow:hidden;">
-                    <div style="background:{bar_color};width:{bar_w}%;height:10px;border-radius:6px;"></div>
-                </div>
-                <div style="min-width:56px;text-align:right;font-weight:800;font-size:15px;
-                    color:{badge_col};">{pct:.1f}%</div>
-                <div style="font-size:11px;color:#94A3B8;min-width:90px;">{s['total']:,} lines</div>
-                <div style="font-size:11px;color:#DC2626;min-width:100px;">
-                    {'⚠️ $' + f"{s['spend_at_risk']:,.0f} at risk" if s['spend_at_risk'] > 0 else ''}</div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-
-    # ── SECTION 2: Score card for selected client ─────────────────────────────
-    title = sel_client if sel_client != "All Clients" else "All Clients"
-    stats = overall_stats if sel_client == "All Clients" else client_summary[sel_client]
-
-    pct   = stats["pct"]
-    color = "#059669" if pct >= 85 else "#D97706" if pct >= 60 else "#DC2626"
-
-    st.markdown(f"### 📊 {title} — Compliance Breakdown")
-
-    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-    for col, (lbl, val, sub, col_hex) in zip(
-        [sc1, sc2, sc3, sc4, sc5],
-        [
-            ("Overall",       f"{pct:.1f}%",                   "passing (✅+⚠️)",          color),
-            ("✅ Compliant",   f"{stats['compliant']:,}",        "≥85% fields matched",     "#059669"),
-            ("⚠️ Partial",     f"{stats['partial']:,}",          "60–84% fields matched",   "#D97706"),
-            ("❌ Non-compliant",f"{stats['non']:,}",             "<60% fields matched",      "#DC2626"),
-            ("💸 Spend at risk",f"${stats['spend_at_risk']:,.0f}","on non-compliant lines",  "#DC2626"),
-        ],
-    ):
-        col.markdown(
-            f"""<div style="background:#fff;border:1px solid #E3E6ED;border-radius:10px;
-                padding:14px 16px;text-align:center;">
-                <div style="font-size:22px;font-weight:800;color:{col_hex};">{val}</div>
-                <div style="font-size:12px;font-weight:600;color:#0F172A;margin-top:2px;">{lbl}</div>
-                <div style="font-size:11px;color:#94A3B8;">{sub}</div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("")
-
-    # ── Field coverage breakdown ──────────────────────────────────────────────
-    with st.expander("📋 Field Coverage Detail", expanded=False):
-        field_rows = []
-        for field in REQUIRED_FIELDS:
-            matched_n = view_df["matched_fields"].apply(
-                lambda x: field in json.loads(x) if isinstance(x, str) else False
-            ).sum()
-            pct_f = matched_n / len(view_df) * 100 if len(view_df) else 0
-            field_rows.append({"Field": field, "Matched": matched_n,
-                               "Total": len(view_df), "Coverage %": round(pct_f, 1)})
-        fc_df = pd.DataFrame(field_rows).sort_values("Coverage %")
-        st.dataframe(
-            fc_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Coverage %": st.column_config.ProgressColumn(
-                    "Coverage %", min_value=0, max_value=100, format="%.1f%%"
-                ),
-            },
-        )
-
-    st.markdown("---")
-
-    # ── SECTION 3: Issues table ───────────────────────────────────────────────
-    st.markdown("### 🔧 Issues to Fix  <span style='font-size:13px;font-weight:400;color:#94A3B8;'>(click a row to see field detail)</span>", unsafe_allow_html=True)
-
-    issues_df = view_df.copy()
-    if show_only == "Issues only (≤ Partial)":
-        issues_df = issues_df[issues_df["compliance_score"] < 0.85]
-
-    issues_df = issues_df.sort_values("spend", ascending=False).reset_index(drop=True)
-
-    if issues_df.empty:
-        st.success("🎉 No issues found for the current filter!")
-    else:
-        # Build display table
-        def fmt_missing(row):
-            try:
-                matched = json.loads(row["matched_fields"])
-                missing = [f for f in REQUIRED_FIELDS if f not in matched]
-                return ", ".join(missing) if missing else "—"
-            except Exception:
-                return row.get("missing_required", "")
-
-        def _status_icon(label):
-            if "Non" in label:   return "❌ Non-compliant"
-            if "Partial" in label: return "⚠️ Partial"
-            return "✅ Compliant"
-
-        display = pd.DataFrame({
-            "Client":          issues_df["client"],
-            "Platform":        issues_df["platform"],
-            "Campaign":        issues_df["campaign"].str[:55],
-            "Line / IO":       issues_df["campaign_line"].str[:45],
-            "Score":           (issues_df["compliance_score"] * 100).round(0).astype(int).astype(str) + "%",
-            "Status":          issues_df["compliance_label"].apply(_status_icon),
-            "Missing Fields":  issues_df.apply(fmt_missing, axis=1),
-            "Spend ($)":       issues_df["spend"].round(0).astype(int),
-        })
-
-        sel = st.dataframe(
-            display,
-            use_container_width=True,
-            hide_index=True,
-            height=420,
-            on_select="rerun",
-            selection_mode="single-row",
-            column_config={
-                "Spend ($)": st.column_config.NumberColumn(format="$%d"),
-                "Score":     st.column_config.TextColumn(width="small"),
-                "Status":    st.column_config.TextColumn(width="medium"),
-            },
-        )
-
-        st.caption(f"Showing {len(issues_df):,} rows · "
-                   f"${issues_df['spend'].sum():,.0f} total spend in view")
-
-        # ── Detail panel ─────────────────────────────────────────────────────
-        selected_rows = sel.selection.rows if sel and sel.selection else []
-        if selected_rows:
-            idx = selected_rows[0]
-            row = issues_df.iloc[idx]
-
-            try:
-                matched_dict = json.loads(row["matched_fields"]) if isinstance(row["matched_fields"], str) else {}
-            except Exception:
-                matched_dict = {}
-
-            score_pct = round(row["compliance_score"] * 100)
-            label     = row["compliance_label"]
-            if "Non" in label:
-                status_color = "#DC2626"; status_bg = "#FEF2F2"; status_icon = "❌"
-            elif "Partial" in label:
-                status_color = "#D97706"; status_bg = "#FFFBEB"; status_icon = "⚠️"
+            # LLM summaries if available
+            if _camp_llm:
+                st.markdown(
+                    '<div style="font-size:13px;color:var(--text-2);margin-bottom:16px;">'
+                    'AI-generated one-liner per campaign based on this week\'s performance.</div>',
+                    unsafe_allow_html=True
+                )
+                _cs_status_cfg = {
+                    "strong":   ("#ECFDF5", "#059669", "✅"),
+                    "on_track": ("#EEF2FF", "#4338CA", "🟦"),
+                    "watch":    ("#FFFBEB", "#D97706", "⚠️"),
+                    "concern":  ("#FEF2F2", "#DC2626", "🔴"),
+                }
+                for _cs in _camp_llm:
+                    _cn    = _cs.get("campaign", "")
+                    _cst   = _cs.get("status", "on_track")
+                    _col   = _cs_status_cfg.get(_cst, _cs_status_cfg["on_track"])
+                    _liner = _cs.get("one_liner", "")
+                    _watch = _cs.get("watch", "")
+                    # Find matching data row
+                    _cd = next((c for c in _camps_tw if c["campaign"] == _cn), {})
+                    _cs_sp  = _cd.get("spend", 0)
+                    _cs_wow = _cd.get("spend_wow_pct")
+                    _wow_badge_html = ""
+                    if _cs_wow is not None:
+                        _wgood  = _cs_wow > 0
+                        _wclr   = "var(--green)" if _wgood else "var(--red)"
+                        _wbg    = "var(--green-bg)" if _wgood else "var(--red-bg)"
+                        _warrow = "▲" if _wgood else "▼"
+                        _wow_badge_html = (
+                            f'<span style="font-size:10px;font-weight:700;color:{_wclr};'
+                            f'background:{_wbg};padding:2px 6px;border-radius:4px;margin-left:6px;">'
+                            f'{_warrow} {abs(_cs_wow):.1f}% WoW</span>'
+                        )
+                    st.markdown(
+                        f'<div style="background:{_col[0]};border-left:3px solid {_col[1]};'
+                        f'border-radius:0 var(--r-sm) var(--r-sm) 0;padding:12px 16px;margin-bottom:8px;">'
+                        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
+                        f'<span style="font-size:11px;">{_col[2]}</span>'
+                        f'<strong style="font-size:13px;color:var(--text-1);">{_cn}</strong>'
+                        f'<span style="font-size:11px;color:var(--text-2);">· ${_cs_sp:,.0f}</span>'
+                        f'{_wow_badge_html}</div>'
+                        f'<div style="font-size:13px;color:var(--text-1);line-height:1.6;">{_liner}</div>'
+                        + (f'<div style="font-size:12px;color:var(--text-2);font-style:italic;margin-top:4px;">👀 Watch: {_watch}</div>' if _watch else "")
+                        + '</div>',
+                        unsafe_allow_html=True
+                    )
             else:
-                status_color = "#059669"; status_bg = "#ECFDF5"; status_icon = "✅"
+                st.info("Enable LLM to get AI campaign summaries.")
 
-            st.markdown("")
-            st.markdown(
-                f"""<div style="border:2px solid {status_color};border-radius:12px;
-                    padding:18px 22px;background:{status_bg};margin-top:8px;">
-                    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                        <div>
-                            <div style="font-size:15px;font-weight:700;color:#0F172A;">
-                                {status_icon} {str(row.get('campaign',''))[:80]}
-                            </div>
-                            <div style="font-size:12px;color:#64748B;margin-top:3px;">
-                                Line / IO: <b>{str(row.get('campaign_line',''))[:80]}</b>
-                            </div>
-                            <div style="font-size:12px;color:#64748B;margin-top:2px;">
-                                {str(row.get('client',''))} &nbsp;·&nbsp; {str(row.get('platform',''))}
-                            </div>
-                        </div>
-                        <div style="text-align:right;">
-                            <div style="font-size:28px;font-weight:800;color:{status_color};">{score_pct}%</div>
-                            <div style="font-size:11px;color:{status_color};font-weight:600;">{label}</div>
-                            <div style="font-size:11px;color:#64748B;">Spend: ${row.get('spend',0):,.0f}</div>
-                        </div>
-                    </div>
-                </div>""",
-                unsafe_allow_html=True,
+            # Full campaign data table
+            st.markdown("##### All Campaigns This Week")
+            _camps_df = pd.DataFrame([
+                {
+                    "Campaign":      c["campaign"],
+                    "Platforms":     c.get("platforms", ""),
+                    "Spend (TW)":    c["spend"],
+                    "Spend (LW)":    c.get("lw_spend"),
+                    "WoW %":         c.get("spend_wow_pct"),
+                    "Impressions":   c["impressions"],
+                    "CPM ($)":       c.get("cpm"),
+                    "CTR (%)":       c.get("ctr"),
+                    "CPC ($)":       c.get("cpc"),
+                }
+                for c in _camps_tw
+            ])
+            st.dataframe(
+                _camps_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Campaign":    st.column_config.TextColumn(width="large"),
+                    "Spend (TW)":  st.column_config.NumberColumn("Spend TW ($)",  format="$%,.0f"),
+                    "Spend (LW)":  st.column_config.NumberColumn("Spend LW ($)",  format="$%,.0f"),
+                    "WoW %":       st.column_config.NumberColumn("WoW %",         format="%.1f%%"),
+                    "Impressions": st.column_config.NumberColumn("Impressions",   format="%,.0f"),
+                    "CPM ($)":     st.column_config.NumberColumn("CPM ($)",       format="$%.2f"),
+                    "CTR (%)":     st.column_config.NumberColumn("CTR (%)",       format="%.3f"),
+                    "CPC ($)":     st.column_config.NumberColumn("CPC ($)",       format="$%.2f"),
+                }
             )
 
-            st.markdown("**Taxonomy Field Breakdown:**")
-
-            ALL_FIELDS = REQUIRED_FIELDS + [f for f in ["Ad Format"] if f not in REQUIRED_FIELDS]
-            field_cols = st.columns(min(len(ALL_FIELDS), 3))
-            for fi, field in enumerate(ALL_FIELDS):
-                col_idx = fi % 3
-                is_required = field in REQUIRED_FIELDS
-                val = matched_dict.get(field, "")
-                matched = bool(val and str(val).strip())
-                if matched:
-                    icon  = "✅"
-                    bg    = "#F0FDF4"
-                    bdr   = "#86EFAC"
-                    label_c = "#166534"
-                    val_txt = str(val)
-                else:
-                    icon  = "❌" if is_required else "○"
-                    bg    = "#FEF2F2" if is_required else "#F8FAFC"
-                    bdr   = "#FCA5A5" if is_required else "#CBD5E1"
-                    label_c = "#DC2626" if is_required else "#94A3B8"
-                    val_txt = "Missing" if is_required else "Not set"
-                req_badge = " <span style='font-size:9px;background:#E0E7FF;color:#3730A3;padding:1px 5px;border-radius:4px;'>required</span>" if is_required else ""
-                field_cols[col_idx].markdown(
-                    f"""<div style="border:1px solid {bdr};border-radius:8px;
-                        padding:10px 12px;background:{bg};margin-bottom:8px;min-height:62px;">
-                        <div style="font-size:11px;font-weight:700;color:{label_c};">
-                            {icon} {field}{req_badge}
-                        </div>
-                        <div style="font-size:12px;color:#1E293B;margin-top:4px;font-weight:500;">
-                            {val_txt}
-                        </div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-            missing_required = [f for f in REQUIRED_FIELDS if not matched_dict.get(f)]
-            if missing_required:
+    # ── TAB 3: Next Week Actions ───────────────────────────────────────────────
+    with wm_t3:
+        _actions = _wm_b.get("next_week_actions", [])
+        if not _actions:
+            st.info("No actions generated.")
+        else:
+            _priority_cfg = {
+                "HIGH":   ("#FEF2F2", "#DC2626"),
+                "MEDIUM": ("#FFFBEB", "#D97706"),
+                "LOW":    ("#F0FDF4", "#059669"),
+            }
+            for _act in _actions:
+                _pri = str(_act.get("priority", "MEDIUM")).upper()
+                _abg, _aclr = _priority_cfg.get(_pri, _priority_cfg["MEDIUM"])
+                _apl  = _act.get("platform", "")
+                _atxt = _act.get("action", "")
+                _arat = _act.get("rationale", "")
                 st.markdown(
-                    f"<div style='font-size:12px;color:#DC2626;margin-top:4px;'>"
-                    f"⚠️ <b>Action needed:</b> Add values for: <b>{', '.join(missing_required)}</b>"
-                    f"</div>",
-                    unsafe_allow_html=True,
+                    f'<div style="background:{_abg};border-left:4px solid {_aclr};'
+                    f'border-radius:0 var(--r-sm) var(--r-sm) 0;padding:14px 18px;margin-bottom:10px;">'
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+                    f'<span style="font-size:10px;font-weight:800;color:{_aclr};background:{_aclr}22;'
+                    f'padding:2px 8px;border-radius:4px;">{_pri}</span>'
+                    f'<span style="font-size:13px;font-weight:600;color:var(--text-1);">{_apl}</span>'
+                    f'</div>'
+                    f'<div style="font-size:14px;color:var(--text-1);font-weight:500;line-height:1.6;margin-bottom:6px;">{_atxt}</div>'
+                    + (f'<div style="font-size:12px;color:var(--text-2);font-style:italic;">{_arat}</div>' if _arat else "")
+                    + '</div>',
+                    unsafe_allow_html=True
                 )
+
+    # ── TAB 4: Talking Points ──────────────────────────────────────────────────
+    with wm_t4:
+        st.markdown(
+            '<div style="font-size:13px;color:var(--text-2);margin-bottom:16px;">'
+            'Topics your client is likely to raise — with context and a suggested framing for each.</div>',
+            unsafe_allow_html=True
+        )
+        _tps = _wm_b.get("talking_points", [])
+        if not _tps:
+            st.info("No talking points generated.")
+        else:
+            for _i, _tp in enumerate(_tps, 1):
+                _topic   = _tp.get("topic", "")
+                _context = _tp.get("context", "")
+                _sq      = _tp.get("suggested_question", "")
+                with st.expander(f"**{_i}. {_topic}**", expanded=(_i == 1)):
+                    if _context:
+                        st.markdown(f"**Context:** {_context}")
+                    if _sq:
+                        st.markdown(
+                            f'<div style="background:#EEF2FF;border-left:3px solid var(--purple);'
+                            f'padding:10px 14px;border-radius:0 6px 6px 0;margin-top:8px;'
+                            f'font-size:13px;color:var(--text-1);">'
+                            f'💬 <em>{_sq}</em></div>',
+                            unsafe_allow_html=True
+                        )
+
+    # ── TAB 5: Raw Data ────────────────────────────────────────────────────────
+    with wm_t5:
+        _rd1, _rd2 = st.tabs(["This Week vs Last Week", "Top Campaigns"])
+
+        with _rd1:
+            # Merge this_week + last_week + wow into one table
+            _tw_map = {r["platform"]: r for r in _wm_d.get("this_week", [])}
+            _lw_map = {r["platform"]: r for r in _wm_d.get("last_week", [])}
+            _ww_map = {r["platform"]: r for r in _wm_d.get("wow", [])}
+            _all_plats = sorted(set(list(_tw_map.keys()) + list(_lw_map.keys())))
+            _merge_rows = []
+            for _pl in _all_plats:
+                _tw_r = _tw_map.get(_pl, {})
+                _lw_r = _lw_map.get(_pl, {})
+                _ww_r = _ww_map.get(_pl, {})
+                _merge_rows.append({
+                    "Platform":         _pl,
+                    "Spend (TW)":       _tw_r.get("spend"),
+                    "Spend (LW)":       _lw_r.get("spend"),
+                    "Spend WoW %":      _ww_r.get("spend_var"),
+                    "Imps (TW)":        _tw_r.get("impressions"),
+                    "CPM (TW)":         _tw_r.get("cpm"),
+                    "CPM WoW %":        _ww_r.get("cpm_var"),
+                    "CTR (TW)":         _tw_r.get("ctr"),
+                    "CTR WoW %":        _ww_r.get("ctr_var"),
+                    "CPC (TW)":         _tw_r.get("cpc"),
+                })
+            _merge_df = pd.DataFrame(_merge_rows)
+            st.dataframe(
+                _merge_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Spend (TW)":  st.column_config.NumberColumn("Spend (TW)",  format="$%,.0f"),
+                    "Spend (LW)":  st.column_config.NumberColumn("Spend (LW)",  format="$%,.0f"),
+                    "Spend WoW %": st.column_config.NumberColumn("Spend WoW %", format="%.1f%%"),
+                    "Imps (TW)":   st.column_config.NumberColumn("Imps (TW)",   format="%,.0f"),
+                    "CPM (TW)":    st.column_config.NumberColumn("CPM (TW)",    format="$%.2f"),
+                    "CPM WoW %":   st.column_config.NumberColumn("CPM WoW %",   format="%.1f%%"),
+                    "CTR (TW)":    st.column_config.NumberColumn("CTR (TW)",    format="%.3f%%"),
+                    "CTR WoW %":   st.column_config.NumberColumn("CTR WoW %",   format="%.1f%%"),
+                    "CPC (TW)":    st.column_config.NumberColumn("CPC (TW)",    format="$%.2f"),
+                }
+            )
+
+        with _rd2:
+            _tc_df = pd.DataFrame(_wm_d.get("top_campaigns", []))
+            if not _tc_df.empty:
+                st.dataframe(
+                    _tc_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "spend":       st.column_config.NumberColumn("Spend ($)",   format="$%,.0f"),
+                        "impressions": st.column_config.NumberColumn("Impressions", format="%,.0f"),
+                        "cpm":         st.column_config.NumberColumn("CPM ($)",     format="$%.2f"),
+                        "ctr":         st.column_config.NumberColumn("CTR (%)",     format="%.3f"),
+                    }
+                )
+            else:
+                st.info("No campaign data found for this week.")
+
+    # ── Cost / generation footnote ────────────────────────────────────────────
+    _wm_tokens = _wm_b.get("_metadata", {}).get("tokens", 0)
+    _wm_cost   = _wm_b.get("_metadata", {}).get("cost",   0.0)
+    _wm_model  = st.session_state.get("settings_llm_model", "gemini-2.5-pro")
+    st.markdown(
+        f'<div style="margin-top:24px;padding:10px 16px;background:var(--border-lt);'
+        f'border-radius:var(--r-sm);font-size:11px;color:var(--text-3);text-align:right;">'
+        f'💰 Brief generated by <strong>Vertex AI · {_wm_model}</strong> · '
+        f'{_wm_tokens:,} tokens · <strong>${_wm_cost:.4f} USD</strong> LLM cost'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 

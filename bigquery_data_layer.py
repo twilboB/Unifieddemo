@@ -32,8 +32,11 @@ def _client():
     return _BQ
 
 def _run(sql: str) -> pd.DataFrame:
-    """Execute a BigQuery SQL statement and return a DataFrame."""
-    return _client().query(sql).to_dataframe()
+    """Execute a BigQuery SQL statement and return a DataFrame.
+    create_bqstorage_client=False forces the standard REST download path and
+    avoids the gRPC bigquerystorage.googleapis.com DNS failure in some networks.
+    """
+    return _client().query(sql).to_dataframe(create_bqstorage_client=False)
 
 def bq_available() -> bool:
     """Return True if BQ can be reached (fast ping)."""
@@ -264,6 +267,7 @@ def assemble_pca_data(
             {base}
             GROUP BY 1,2,3,4,5,6,7,8,9,10
             ORDER BY spend DESC
+            LIMIT 300
         """)
     except Exception:
         lines_df = pd.DataFrame()
@@ -371,6 +375,7 @@ def assemble_pca_data(
                   SUM(clicks)      AS clicks
                 {base}
                   AND {field} IS NOT NULL
+                  AND TRIM(CAST({field} AS STRING)) != ''
                 GROUP BY {field}
                 ORDER BY spend DESC
             """)
@@ -384,7 +389,10 @@ def assemble_pca_data(
                 "value":           str(r.val),
                 "spend":           round(float(r.spend or 0), 2),
                 "impressions":     int(r.impressions or 0),
+                "clicks":          int(r.clicks or 0),
                 "cpm":             round(float(r.spend or 0) / max(int(r.impressions or 1), 1) * 1000, 2)
+                                   if (r.impressions or 0) > 0 else None,
+                "ctr":             round(int(r.clicks or 0) / max(int(r.impressions or 1), 1) * 100, 3)
                                    if (r.impressions or 0) > 0 else None,
                 "spend_share_pct": round(float(r.spend or 0) / max(total, 1) * 100, 1),
             }
@@ -550,7 +558,7 @@ def build_live_clients() -> dict:
                 "end":               str(r.end_date)[:10],
                 "platforms_digital": plats,
                 "platforms_offline": [],
-                "monthly_spend":     round(float(r.total_spend or 0) / months),
+                "monthly_spend":     int(float(r.total_spend or 0) / max(months, 1)) if not pd.isna(float(r.total_spend or 0) / max(months, 1)) else 0,
             }
         live[client] = {"name": client, "category": "BigQuery Live", "campaigns": campaigns}
     return live
@@ -558,103 +566,683 @@ def build_live_clients() -> dict:
 
 # ── Q&A context builder ────────────────────────────────────────────────────────
 
-def get_qa_context(question: str, start_date="2025-01-01", end_date="2026-12-31") -> dict:
-    """
-    Fetch relevant aggregated data from BigQuery to use as LLM context
-    for answering a natural-language question.
+@lru_cache(maxsize=1)
+def _dataset_date_bounds() -> tuple[str, str]:
+    """Return (min_date, max_date) for the entire table — cached for the session."""
+    try:
+        r = _run(f"SELECT MIN(date) AS d_min, MAX(date) AS d_max FROM {TABLE_ID}").iloc[0]
+        return str(r.d_min)[:10], str(r.d_max)[:10]
+    except Exception:
+        return "2025-01-01", "2026-12-31"
 
-    Returns a dict with:
-      - portfolio_summary: spend by client + platform
-      - taxonomy_summary: objective/format/geo/publisher breakdowns across all clients
-      - date_range: the queried range
+
+def _parse_date_range_from_question(question: str) -> tuple[str, str]:
     """
+    Parse natural-language date references in a question into (start_date, end_date).
+    Handles: last week, this week, yesterday, last month, this month, this year,
+    last year, named months (January…), quarters (Q1-Q4), and explicit years.
+    Falls back to last 90 days.
+    """
+    import calendar as _cal
+    from datetime import date as _date, timedelta as _td
+
+    today = _date.today()
+    q     = question.lower()
+
+    # Relative week
+    if "last week" in q:
+        last_mon = today - _td(days=today.weekday() + 7)
+        return str(last_mon), str(last_mon + _td(days=6))
+    if "this week" in q:
+        return str(today - _td(days=today.weekday())), str(today)
+
+    # Yesterday / today
+    if "yesterday" in q:
+        yd = today - _td(days=1)
+        return str(yd), str(yd)
+    if "today" in q:
+        return str(today), str(today)
+
+    # Last N days
+    import re as _re2
+    m = _re2.search(r'last\s+(\d+)\s+days?', q)
+    if m:
+        n = int(m.group(1))
+        return str(today - _td(days=n)), str(today)
+
+    # Relative month
+    if "last month" in q:
+        first_this = _date(today.year, today.month, 1)
+        last_end   = first_this - _td(days=1)
+        return str(_date(last_end.year, last_end.month, 1)), str(last_end)
+    if "this month" in q:
+        return str(_date(today.year, today.month, 1)), str(today)
+
+    # Relative year
+    if "last year" in q:
+        y = today.year - 1
+        return f"{y}-01-01", f"{y}-12-31"
+    if "this year" in q or "ytd" in q:
+        return f"{today.year}-01-01", str(today)
+
+    # Named month (optionally with year)
+    MONTH_MAP = {
+        "january": 1, "jan": 1, "february": 2, "feb": 2,
+        "march": 3,   "mar": 3, "april": 4,    "apr": 4,
+        "may": 5,     "june": 6, "jun": 6,      "july": 7,
+        "jul": 7,     "august": 8, "aug": 8,    "september": 9,
+        "sep": 9,     "sept": 9, "october": 10, "oct": 10,
+        "november": 11, "nov": 11, "december": 12, "dec": 12,
+    }
+    year_m    = _re2.search(r'\b(202\d)\b', q)
+    explicit_year = year_m is not None
+    # If no explicit year, pick the year that actually has data for this month
+    ds_min, ds_max = _dataset_date_bounds()
+    ds_max_year = int(ds_max[:4])
+    ds_min_year = int(ds_min[:4])
+
+    for name, mnum in MONTH_MAP.items():
+        if name in q:
+            if explicit_year:
+                yr = int(year_m.group(1))
+            else:
+                # Prefer the year within the dataset that has this month
+                # Try dataset max year first, then fall back to min year
+                yr = ds_max_year
+                if ds_min_year != ds_max_year:
+                    # Check if this month is before the dataset start in the max year
+                    _, last_day_check = _cal.monthrange(yr, mnum)
+                    if f"{yr}-{mnum:02d}-{last_day_check}" < ds_min:
+                        yr = ds_min_year
+                    elif f"{yr}-{mnum:02d}-01" > ds_max:
+                        yr = ds_min_year
+            _, last_day = _cal.monthrange(yr, mnum)
+            return f"{yr}-{mnum:02d}-01", f"{yr}-{mnum:02d}-{last_day:02d}"
+
+    # Quarters
+    for qnum, (qm_s, qm_e) in {1: (1, 3), 2: (4, 6), 3: (7, 9), 4: (10, 12)}.items():
+        if f"q{qnum}" in q:
+            if explicit_year:
+                yr = int(year_m.group(1))
+            else:
+                yr = ds_max_year
+                if f"{yr}-{qm_s:02d}-01" > ds_max:
+                    yr = ds_min_year
+            _, last_day = _cal.monthrange(yr, qm_e)
+            return f"{yr}-{qm_s:02d}-01", f"{yr}-{qm_e:02d}-{last_day:02d}"
+
+    # Explicit year only
+    if explicit_year:
+        yr = int(year_m.group(1))
+        return f"{yr}-01-01", f"{yr}-12-31"
+
+    # Default: use entire dataset range so "give me a summary" returns all data
+    return ds_min, ds_max
+
+
+def get_qa_context(question: str, start_date: str | None = None, end_date: str | None = None) -> dict:
+    """
+    Fetch granular BigQuery data relevant to the question.
+    Automatically parses natural-language date references (last week, January, Q2, etc.)
+    Returns a rich context dict for the LLM including weekly breakdown and totals.
+    """
+    from datetime import date as _date
+    import re as _re2
+
+    # ── Date range ─────────────────────────────────────────────────────────────
+    if start_date is None or end_date is None:
+        start_date, end_date = _parse_date_range_from_question(question)
+
     q_upper = question.upper()
+    q_lower = question.lower()
 
-    # Detect which clients / platforms are mentioned
-    ALL_CLIENTS   = ["Mazda", "Simplot", "Coles", "Hanes", "RACV"]
-    ALL_PLATFORMS = ["DV360", "Meta", "TikTok", "Google Search", "TTD",
-                     "Pinterest", "Snapchat", "Bing"]
+    # ── Detect mentioned clients & platforms ──────────────────────────────────
+    # Pull live client list from BQ so we're not hardcoding names
+    try:
+        df_known = _run(f"SELECT DISTINCT client FROM {TABLE_ID}")
+        ALL_CLIENTS = df_known["client"].dropna().tolist()
+    except Exception:
+        ALL_CLIENTS = ["Mazda", "Simplot", "Coles", "Hanes", "RACV"]
+
+    ALL_PLATFORMS = ["DV360", "Meta", "TikTok", "Google Search", "Google Ads",
+                     "TTD", "Pinterest", "Snapchat", "Bing", "YouTube",
+                     "Facebook", "Instagram", "TV", "Radio", "OOH"]
 
     mentioned_clients   = [c for c in ALL_CLIENTS   if c.upper() in q_upper]
     mentioned_platforms = [p for p in ALL_PLATFORMS if p.upper() in q_upper]
 
     client_filter   = f"AND client IN ({','.join(repr(c) for c in mentioned_clients)})"   if mentioned_clients   else ""
-    platform_filter = f"AND platform IN ({','.join(repr(p) for p in mentioned_platforms)})" if mentioned_platforms else ""
+    platform_filter = f"AND UPPER(platform) IN ({','.join(repr(p.upper()) for p in mentioned_platforms)})" if mentioned_platforms else ""
 
-    base_where = (
-        f"WHERE {_date_where(start_date, end_date)} {client_filter} {platform_filter}"
-    )
+    base_where = f"WHERE {_date_where(start_date, end_date)} {client_filter} {platform_filter}"
 
-    context: dict[str, Any] = {"date_range": f"{start_date} to {end_date}"}
+    # ── Always expose the full dataset bounds (unfiltered) so LLM can redirect user ──
+    ds_min, ds_max = _dataset_date_bounds()
 
-    # Portfolio summary
+    context: dict[str, Any] = {
+        "queried_period":       f"{start_date} to {end_date}",
+        "question_received":    question,
+        "clients_filtered":     mentioned_clients or "all",
+        "platforms_filtered":   mentioned_platforms or "all",
+        "dataset_full_range":   f"{ds_min} to {ds_max}",  # always tell LLM what IS available
+    }
+
+    # ── Check if any data exists in this period first ──────────────────────────
+    try:
+        df_check = _run(f"SELECT MIN(date) AS d_min, MAX(date) AS d_max, COUNT(*) AS row_count FROM {TABLE_ID} {base_where}")
+        row = df_check.iloc[0]
+        rows_in_period = int(row.row_count)
+        context["data_availability"] = {
+            "rows_in_period": rows_in_period,
+            "earliest_date":  str(row.d_min)[:10] if row.d_min else None,
+            "latest_date":    str(row.d_max)[:10] if row.d_max else None,
+            "dataset_full_range": f"{ds_min} to {ds_max}",
+        }
+    except Exception:
+        rows_in_period = 0
+        context["data_availability"] = {"rows_in_period": 0, "dataset_full_range": f"{ds_min} to {ds_max}"}
+
+    # ── Auto-retry with full dataset range if this period is empty ────────────
+    # (catches cases like "may" defaulting to wrong year)
+    if rows_in_period == 0 and (start_date != ds_min or end_date != ds_max):
+        base_where = f"WHERE {_date_where(ds_min, ds_max)} {client_filter} {platform_filter}"
+        context["queried_period"] = f"{ds_min} to {ds_max} (auto-expanded: no data found for {start_date}→{end_date})"
+        context["auto_expanded"]  = True
+        # Re-check
+        try:
+            df_check2 = _run(f"SELECT COUNT(*) AS row_count FROM {TABLE_ID} {base_where}")
+            rows_in_period = int(df_check2.iloc[0].row_count)
+            context["data_availability"]["rows_in_period"] = rows_in_period
+        except Exception:
+            pass
+
+    # ── Spend/impressions/clicks by client + platform ─────────────────────────
     try:
         df_port = _run(f"""
-            SELECT client, platform,
-                   SUM(spend)       AS spend,
-                   SUM(impressions) AS impressions,
-                   SUM(clicks)      AS clicks,
-                   SUM(video_completions) AS video_completions
+            SELECT
+              client, platform,
+              SUM(spend)             AS spend,
+              SUM(impressions)       AS impressions,
+              SUM(clicks)            AS clicks,
+              SUM(video_completions) AS video_completions,
+              SAFE_DIVIDE(SUM(spend),       SUM(impressions)) * 1000 AS cpm,
+              SAFE_DIVIDE(SUM(clicks),      SUM(impressions)) * 100  AS ctr,
+              SAFE_DIVIDE(SUM(spend),       SUM(clicks))             AS cpc,
+              SAFE_DIVIDE(SUM(spend),       SUM(video_completions))  AS cpcv
             FROM {TABLE_ID}
             {base_where}
             GROUP BY client, platform
             ORDER BY spend DESC
-            LIMIT 100
+            LIMIT 150
         """)
-        context["portfolio_summary"] = df_port.to_dict(orient="records")
+        context["by_client_platform"] = df_port.to_dict(orient="records")
+        # Top-level totals
+        context["totals"] = {
+            "spend":       float(df_port.spend.sum()),
+            "impressions": float(df_port.impressions.sum()),
+            "clicks":      float(df_port.clicks.sum()),
+        }
     except Exception:
-        context["portfolio_summary"] = []
+        context["by_client_platform"] = []
 
-    # Taxonomy coverage summary
+    # ── Weekly breakdown (always included — key for "last week" questions) ─────
     try:
-        df_tax = _run(f"""
+        df_wk = _run(f"""
+            SELECT
+              client,
+              DATE_TRUNC(date, WEEK(MONDAY)) AS week_start,
+              SUM(spend)       AS spend,
+              SUM(impressions) AS impressions,
+              SUM(clicks)      AS clicks
+            FROM {TABLE_ID}
+            {base_where}
+            GROUP BY client, week_start
+            ORDER BY week_start DESC, spend DESC
+            LIMIT 200
+        """)
+        context["weekly_by_client"] = df_wk.to_dict(orient="records")
+    except Exception:
+        context["weekly_by_client"] = []
+
+    # ── Daily breakdown for short windows (≤14 days) ──────────────────────────
+    try:
+        from datetime import datetime as _dt2
+        sd = _dt2.strptime(start_date, "%Y-%m-%d").date()
+        ed = _dt2.strptime(end_date,   "%Y-%m-%d").date()
+        if (ed - sd).days <= 14:
+            df_day = _run(f"""
+                SELECT client, platform, date,
+                       SUM(spend) AS spend, SUM(impressions) AS impressions, SUM(clicks) AS clicks
+                FROM {TABLE_ID}
+                {base_where}
+                GROUP BY client, platform, date
+                ORDER BY date DESC, spend DESC
+                LIMIT 300
+            """)
+            context["daily_detail"] = df_day.to_dict(orient="records")
+    except Exception:
+        pass
+
+    # ── Monthly breakdown (for trend / multi-month questions) ─────────────────
+    try:
+        df_mo = _run(f"""
+            SELECT client, platform,
+                   FORMAT_DATE('%Y-%m', date) AS month,
+                   SUM(spend) AS spend, SUM(impressions) AS impressions
+            FROM {TABLE_ID}
+            {base_where}
+            GROUP BY client, platform, month
+            ORDER BY month DESC, spend DESC
+            LIMIT 200
+        """)
+        context["monthly_by_client_platform"] = df_mo.to_dict(orient="records")
+    except Exception:
+        pass
+
+    # ── Taxonomy breakdowns ───────────────────────────────────────────────────
+    # Each breakdown: spend + impressions by taxonomy field so the LLM can
+    # answer questions about objective split, format mix, geo, publisher, etc.
+    def _tax_breakdown(field, alias, limit=80):
+        try:
+            df2 = _run(f"""
+                SELECT client, platform, {field} AS {alias},
+                       SUM(spend) AS spend, SUM(impressions) AS impressions,
+                       SUM(clicks) AS clicks,
+                       SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm,
+                       SAFE_DIVIDE(SUM(clicks), SUM(impressions)) * 100  AS ctr
+                FROM {TABLE_ID}
+                {base_where}
+                  AND {field} IS NOT NULL AND TRIM({field}) != ''
+                GROUP BY client, platform, {field}
+                ORDER BY spend DESC
+                LIMIT {limit}
+            """)
+            return df2.to_dict(orient="records")
+        except Exception:
+            return []
+
+    context["by_objective"]        = _tax_breakdown("objective",        "objective",        100)
+    context["by_format"]           = _tax_breakdown("format",           "format",            80)
+    context["by_geo"]              = _tax_breakdown("geo_target",       "geo_target",        80)
+    context["by_publisher"]        = _tax_breakdown("publisher_name",   "publisher_name",    80)
+    context["by_audience_segment"] = _tax_breakdown("audience_segment", "audience_segment",  60)
+    context["by_ad_type"]          = _tax_breakdown("ad_type",          "ad_type",           60)
+    context["by_buy_type"]         = _tax_breakdown("buy_type",         "buy_type",          40)
+
+    return context
+
+
+# ── Taxonomy Coverage ──────────────────────────────────────────────────────────
+
+TAXONOMY_FIELDS = {
+    "objective":        "Objective",
+    "format":           "Format / Media Type",
+    "geo_target":       "Geo Target",
+    "publisher_name":   "Publisher",
+    "audience_segment": "Audience / Tactic",
+    "ad_type":          "Ad Type",
+}
+
+
+def get_taxonomy_coverage_bq(start_date: str, end_date: str) -> dict:
+    """
+    Return taxonomy field coverage stats for Taxonomy Compliance view.
+    Queries BQ directly (no pickle files needed).
+
+    Returns dict with:
+      - 'summary': {client: {field: {total, filled, pct, spend_total, spend_missing}}}
+      - 'overall': {field: {total, filled, pct, spend_missing}}
+      - 'by_platform': {client: {platform: {field: pct}}}
+      - 'campaigns_missing': list of {client, platform, campaign, missing_fields, spend, impressions, row_count}
+    """
+    try:
+        df = _run(f"""
             SELECT
               client,
               platform,
+              COALESCE(NULLIF(TRIM(campaign_description), ''), campaign_name, 'Unknown') AS campaign,
+              SUM(spend) AS spend,
+              SUM(impressions) AS impressions,
               COUNT(*) AS row_count,
-              ROUND(100.0 * COUNTIF(objective IS NOT NULL)      / COUNT(*), 1) AS obj_pct,
-              ROUND(100.0 * COUNTIF(format IS NOT NULL)         / COUNT(*), 1) AS fmt_pct,
-              ROUND(100.0 * COUNTIF(geo_target IS NOT NULL)     / COUNT(*), 1) AS geo_pct,
-              ROUND(100.0 * COUNTIF(publisher_name IS NOT NULL) / COUNT(*), 1) AS pub_pct
+              COUNTIF(objective IS NOT NULL AND TRIM(objective) != '') AS has_objective,
+              COUNTIF(format IS NOT NULL AND TRIM(format) != '') AS has_format,
+              COUNTIF(geo_target IS NOT NULL AND TRIM(geo_target) != '') AS has_geo_target,
+              COUNTIF(publisher_name IS NOT NULL AND TRIM(publisher_name) != '') AS has_publisher_name,
+              COUNTIF(audience_segment IS NOT NULL AND TRIM(audience_segment) != '') AS has_audience_segment,
+              COUNTIF(ad_type IS NOT NULL AND TRIM(ad_type) != '') AS has_ad_type,
+              SUM(CASE WHEN objective IS NULL OR TRIM(objective) = '' THEN spend ELSE 0 END) AS spend_missing_objective,
+              SUM(CASE WHEN format IS NULL OR TRIM(format) = '' THEN spend ELSE 0 END) AS spend_missing_format,
+              SUM(CASE WHEN geo_target IS NULL OR TRIM(geo_target) = '' THEN spend ELSE 0 END) AS spend_missing_geo,
+              SUM(CASE WHEN publisher_name IS NULL OR TRIM(publisher_name) = '' THEN spend ELSE 0 END) AS spend_missing_publisher,
+              SUM(CASE WHEN audience_segment IS NULL OR TRIM(audience_segment) = '' THEN spend ELSE 0 END) AS spend_missing_audience,
+              SUM(CASE WHEN ad_type IS NULL OR TRIM(ad_type) = '' THEN spend ELSE 0 END) AS spend_missing_adtype
             FROM {TABLE_ID}
-            {base_where}
-            GROUP BY client, platform
-            ORDER BY client, spend DESC
+            WHERE date BETWEEN '{start_date}' AND '{end_date}'
+            GROUP BY client, platform, campaign
+            ORDER BY spend DESC
         """)
-        context["taxonomy_coverage"] = df_tax.to_dict(orient="records")
-    except Exception:
-        context["taxonomy_coverage"] = []
+    except Exception as e:
+        return {}
 
-    # Breakdown by objective (if question asks about it)
-    if any(kw in q_upper for kw in ["OBJECTIVE", "AWARENESS", "PERFORMANCE", "REACH"]):
+    if df is None or df.empty:
+        return {}
+
+    # Column map: taxonomy field key -> (has_col, spend_missing_col)
+    field_col_map = {
+        "objective":        ("has_objective",        "spend_missing_objective"),
+        "format":           ("has_format",           "spend_missing_format"),
+        "geo_target":       ("has_geo_target",       "spend_missing_geo"),
+        "publisher_name":   ("has_publisher_name",   "spend_missing_publisher"),
+        "audience_segment": ("has_audience_segment", "spend_missing_audience"),
+        "ad_type":          ("has_ad_type",          "spend_missing_adtype"),
+    }
+
+    # ── Build per-client summary ───────────────────────────────────────────────
+    summary: dict = {}
+    for client, grp in df.groupby("client"):
+        summary[client] = {}
+        for fkey, (has_col, miss_col) in field_col_map.items():
+            total        = int(grp["row_count"].sum())
+            filled       = int(grp[has_col].sum())
+            spend_total  = float(grp["spend"].sum())
+            spend_miss   = float(grp[miss_col].sum())
+            pct          = (filled / max(total, 1)) * 100
+            summary[client][fkey] = {
+                "total":         total,
+                "filled":        filled,
+                "pct":           round(pct, 1),
+                "spend_total":   round(spend_total, 2),
+                "spend_missing": round(spend_miss, 2),
+            }
+
+    # ── Overall (portfolio) ────────────────────────────────────────────────────
+    overall: dict = {}
+    for fkey, (has_col, miss_col) in field_col_map.items():
+        total      = int(df["row_count"].sum())
+        filled     = int(df[has_col].sum())
+        spend_miss = float(df[miss_col].sum())
+        overall[fkey] = {
+            "total":         total,
+            "filled":        filled,
+            "pct":           round((filled / max(total, 1)) * 100, 1),
+            "spend_missing": round(spend_miss, 2),
+        }
+
+    # ── By platform (per client) ───────────────────────────────────────────────
+    by_platform: dict = {}
+    for (client, platform), grp in df.groupby(["client", "platform"]):
+        if client not in by_platform:
+            by_platform[client] = {}
+        plat_fields = {}
+        for fkey, (has_col, _) in field_col_map.items():
+            total  = int(grp["row_count"].sum())
+            filled = int(grp[has_col].sum())
+            plat_fields[fkey] = round((filled / max(total, 1)) * 100, 1)
+        by_platform[client][platform] = plat_fields
+
+    # ── Campaigns missing required fields ─────────────────────────────────────
+    REQUIRED_FIELDS_BQ = ["objective", "format", "geo_target"]
+    camps_missing = []
+    for _, row in df.iterrows():
+        missing = []
+        for fkey in REQUIRED_FIELDS_BQ:
+            has_col = field_col_map[fkey][0]
+            # A row is "missing" a field if fewer filled than total rows in that segment
+            if int(row[has_col]) < int(row["row_count"]):
+                missing.append(TAXONOMY_FIELDS[fkey])
+        if missing:
+            camps_missing.append({
+                "client":        row["client"],
+                "platform":      row["platform"],
+                "campaign":      str(row["campaign"]),
+                "missing_fields": missing,
+                "spend":         float(row["spend"]),
+                "impressions":   int(row["impressions"]),
+                "row_count":     int(row["row_count"]),
+            })
+
+    # Sort by spend desc, cap at 200
+    camps_missing.sort(key=lambda x: x["spend"], reverse=True)
+    camps_missing = camps_missing[:200]
+
+    return {
+        "summary":           summary,
+        "overall":           overall,
+        "by_platform":       by_platform,
+        "campaigns_missing": camps_missing,
+    }
+
+
+# ── Weekly Meet data ───────────────────────────────────────────────────────────
+
+def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict:
+    """
+    Pull all data needed for a Weekly Meet / WIP meeting brief.
+
+    Returns:
+        client, week_start, week_end, prev_start, prev_end,
+        this_week  (per-platform metrics),
+        last_week  (per-platform metrics for previous 7 days),
+        wow        (week-on-week variance per platform),
+        by_objective, by_format, by_geo, by_publisher,
+        top_campaigns (top 10 by spend this week),
+        daily_trend   (daily spend per platform),
+        totals        (rolled-up summary across all platforms)
+    """
+    from datetime import datetime, timedelta
+
+    ws = datetime.strptime(week_start, "%Y-%m-%d")
+    we = datetime.strptime(week_end,   "%Y-%m-%d")
+    prev_end   = (ws - timedelta(days=1)).strftime("%Y-%m-%d")
+    prev_start = (ws - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    def _plat(start, end):
         try:
-            df_obj = _run(f"""
-                SELECT client, objective, SUM(spend) AS spend
+            df = _run(f"""
+                SELECT
+                  platform,
+                  SUM(spend)              AS spend,
+                  SUM(impressions)        AS impressions,
+                  SUM(clicks)             AS clicks,
+                  SUM(video_completions)  AS vcr,
+                  SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm,
+                  SAFE_DIVIDE(SUM(clicks), SUM(impressions)) * 100 AS ctr,
+                  SAFE_DIVIDE(SUM(spend), SUM(clicks))              AS cpc,
+                  SAFE_DIVIDE(SUM(spend), SUM(video_completions))   AS cpcv
                 FROM {TABLE_ID}
-                {base_where}
-                  AND objective IS NOT NULL
-                GROUP BY client, objective
+                WHERE client = '{_esc(client_id)}'
+                  AND date BETWEEN '{start}' AND '{end}'
+                  AND spend > 0
+                GROUP BY platform
                 ORDER BY spend DESC
             """)
-            context["objective_breakdown"] = df_obj.to_dict(orient="records")
         except Exception:
-            pass
+            return []
+        rows = []
+        for _, r in df.iterrows():
+            rows.append({
+                "platform":    str(r.platform),
+                "spend":       round(float(r.spend) if pd.notna(r.spend) else 0.0, 2),
+                "impressions": int(r.impressions)   if pd.notna(r.impressions) else 0,
+                "clicks":      int(r.clicks)        if pd.notna(r.clicks)      else 0,
+                "vcr":         int(r.vcr)           if pd.notna(r.vcr)         else 0,
+                "cpm":         round(float(r.cpm),  2) if pd.notna(r.cpm)  else None,
+                "ctr":         round(float(r.ctr),  3) if pd.notna(r.ctr)  else None,
+                "cpc":         round(float(r.cpc),  2) if pd.notna(r.cpc)  else None,
+                "cpcv":        round(float(r.cpcv), 2) if pd.notna(r.cpcv) else None,
+            })
+        return rows
 
-    # Monthly trend if time-related question
-    if any(kw in q_upper for kw in ["MONTH", "TREND", "OVER TIME", "WEEKLY", "JANUARY", "FEBRUARY",
-                                      "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST",
-                                      "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]):
+    this_week = _plat(week_start, week_end)
+    last_week = _plat(prev_start, prev_end)
+
+    # Week-on-week variance per platform
+    lw_map = {r["platform"]: r for r in last_week}
+    wow = []
+    for r in this_week:
+        pl  = r["platform"]
+        lw  = lw_map.get(pl, {})
+        def _var(key):
+            a = r.get(key)
+            b = lw.get(key)
+            if a is None or b is None or b == 0:
+                return None
+            return round((a - b) / abs(b) * 100, 1)
+        wow.append({
+            "platform":    pl,
+            "spend_var":   _var("spend"),
+            "cpm_var":     _var("cpm"),
+            "ctr_var":     _var("ctr"),
+            "cpc_var":     _var("cpc"),
+            "imps_var":    _var("impressions"),
+        })
+
+    # Taxonomy breakdowns for the week
+    def _breakdown(field, alias, limit=30):
         try:
-            df_mo = _run(f"""
-                SELECT client, FORMAT_DATE('%Y-%m', date) AS month,
-                       SUM(spend) AS spend
+            df2 = _run(f"""
+                SELECT {field} AS val,
+                  SUM(spend) AS spend, SUM(impressions) AS impressions, SUM(clicks) AS clicks,
+                  SAFE_DIVIDE(SUM(spend), SUM(impressions)) * 1000 AS cpm,
+                  SAFE_DIVIDE(SUM(clicks), SUM(impressions)) * 100  AS ctr
                 FROM {TABLE_ID}
-                {base_where}
-                GROUP BY client, month
-                ORDER BY client, month
+                WHERE client = '{_esc(client_id)}'
+                  AND date BETWEEN '{week_start}' AND '{week_end}'
+                  AND spend > 0
+                  AND {field} IS NOT NULL
+                  AND TRIM(CAST({field} AS STRING)) != ''
+                GROUP BY {field}
+                ORDER BY spend DESC
+                LIMIT {limit}
             """)
-            context["monthly_trend"] = df_mo.to_dict(orient="records")
         except Exception:
-            pass
+            return []
+        total = float(df2["spend"].sum()) if not df2.empty else 1
+        return [
+            {
+                alias:         str(r.val),
+                "spend":       round(float(r.spend) if pd.notna(r.spend) else 0.0, 2),
+                "impressions": int(r.impressions)   if pd.notna(r.impressions) else 0,
+                "clicks":      int(r.clicks)        if pd.notna(r.clicks)      else 0,
+                "cpm":         round(float(r.cpm),  2) if pd.notna(r.cpm)  else None,
+                "ctr":         round(float(r.ctr),  3) if pd.notna(r.ctr)  else None,
+                "spend_pct":   round((float(r.spend) if pd.notna(r.spend) else 0.0) / max(total, 1) * 100, 1),
+            }
+            for _, r in df2.iterrows()
+        ]
 
-    return context
+    by_objective = _breakdown("objective",      "objective")
+    by_format    = _breakdown("format",          "format")
+    by_geo       = _breakdown("geo_target",      "geo_target")
+    by_publisher = _breakdown("publisher_name",  "publisher_name")
+
+    # Campaign-level summary by campaign_description — this week + previous week for WoW
+    def _camp_week(start, end, limit=60):
+        try:
+            df = _run(f"""
+                SELECT
+                  COALESCE(NULLIF(TRIM(campaign_description), ''), campaign_name, 'Unknown') AS campaign,
+                  SUM(spend) AS spend, SUM(impressions) AS impressions, SUM(clicks) AS clicks,
+                  SAFE_DIVIDE(SUM(spend),  SUM(impressions)) * 1000 AS cpm,
+                  SAFE_DIVIDE(SUM(clicks), SUM(impressions)) * 100  AS ctr,
+                  SAFE_DIVIDE(SUM(spend),  SUM(clicks))              AS cpc,
+                  COUNT(DISTINCT platform) AS n_platforms,
+                  STRING_AGG(DISTINCT platform ORDER BY platform LIMIT 5) AS platforms
+                FROM {TABLE_ID}
+                WHERE client = '{_esc(client_id)}'
+                  AND date BETWEEN '{start}' AND '{end}'
+                  AND spend > 0
+                GROUP BY 1
+                ORDER BY spend DESC
+                LIMIT {limit}
+            """)
+        except Exception:
+            return []
+        return [
+            {
+                "campaign":     str(r.campaign),
+                "spend":        round(float(r.spend)        if pd.notna(r.spend)        else 0.0, 2),
+                "impressions":  int(r.impressions)          if pd.notna(r.impressions)  else 0,
+                "clicks":       int(r.clicks)               if pd.notna(r.clicks)       else 0,
+                "cpm":          round(float(r.cpm),  2)     if pd.notna(r.cpm)          else None,
+                "ctr":          round(float(r.ctr),  3)     if pd.notna(r.ctr)          else None,
+                "cpc":          round(float(r.cpc),  2)     if pd.notna(r.cpc)          else None,
+                "n_platforms":  int(r.n_platforms)          if pd.notna(r.n_platforms)  else 0,
+                "platforms":    str(r.platforms or ""),
+            }
+            for _, r in df.iterrows()
+        ]
+
+    campaigns_this_week = _camp_week(week_start, week_end)
+    campaigns_last_week = _camp_week(prev_start,  prev_end)
+
+    # Build WoW map for campaigns (keyed by campaign description)
+    _cmp_lw_map = {r["campaign"]: r for r in campaigns_last_week}
+    for c in campaigns_this_week:
+        lw = _cmp_lw_map.get(c["campaign"], {})
+        lw_sp = lw.get("spend", 0)
+        c["lw_spend"]     = round(lw_sp, 2) if lw_sp else None
+        c["spend_wow_pct"] = round((c["spend"] - lw_sp) / max(lw_sp, 0.01) * 100, 1) if lw_sp else None
+
+    # Keep a short top_campaigns list for LLM context (top 10 by spend)
+    top_campaigns = [
+        {"campaign": c["campaign"], "spend": c["spend"], "impressions": c["impressions"],
+         "cpm": c["cpm"], "ctr": c["ctr"]}
+        for c in campaigns_this_week[:10]
+    ]
+
+    # Daily spend trend for the week (for chart)
+    try:
+        dd_df = _run(f"""
+            SELECT
+              CAST(date AS STRING) AS day,
+              platform,
+              SUM(spend) AS spend
+            FROM {TABLE_ID}
+            WHERE client = '{_esc(client_id)}'
+              AND date BETWEEN '{week_start}' AND '{week_end}'
+              AND spend > 0
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+        """)
+        daily_trend = [
+            {"day": str(r.day), "platform": str(r.platform), "spend": round(float(r.spend or 0), 2)}
+            for _, r in dd_df.iterrows()
+        ]
+    except Exception:
+        daily_trend = []
+
+    # Rolled-up totals
+    total_spend = sum(r["spend"] for r in this_week)
+    total_imps  = sum(r["impressions"] for r in this_week)
+    total_clicks = sum(r["clicks"] for r in this_week)
+    lw_total_spend = sum(r["spend"] for r in last_week)
+    totals = {
+        "spend":        round(total_spend, 2),
+        "impressions":  total_imps,
+        "clicks":       total_clicks,
+        "cpm":          round(total_spend / max(total_imps, 1) * 1000, 2) if total_imps else None,
+        "ctr":          round(total_clicks / max(total_imps, 1) * 100, 3) if total_imps else None,
+        "lw_spend":     round(lw_total_spend, 2),
+        "spend_wow_pct": round((total_spend - lw_total_spend) / max(lw_total_spend, 1) * 100, 1) if lw_total_spend else None,
+        "n_platforms":  len(this_week),
+    }
+
+    return {
+        "client":       client_id,
+        "week_start":   week_start,
+        "week_end":     week_end,
+        "prev_start":   prev_start,
+        "prev_end":     prev_end,
+        "this_week":    this_week,
+        "last_week":    last_week,
+        "wow":          wow,
+        "by_objective": by_objective,
+        "by_format":    by_format,
+        "by_geo":       by_geo,
+        "by_publisher": by_publisher,
+        "top_campaigns":       top_campaigns,
+        "campaigns_this_week": campaigns_this_week,
+        "daily_trend":         daily_trend,
+        "totals":              totals,
+    }

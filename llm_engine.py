@@ -10,7 +10,7 @@ import streamlit as st
 _GEMINI_API_KEY  = os.environ.get("GOOGLE_API_KEY", "AIzaSyBviCi2R70-HV0lpEtCIggrv5WRmMyItM8")
 _VERTEX_PROJECT  = "res-apac-dev-skynet-au"
 _VERTEX_LOCATION = "us-central1"
-_VERTEX_MODEL    = "gemini-2.5-pro"
+_VERTEX_MODEL    = "gemini-2.5-pro"                  # confirmed available on res-apac-dev-skynet-au
 
 def _gemini_client():
     """Return Vertex AI client (ADC) when enabled, otherwise Google AI Studio (API key)."""
@@ -35,31 +35,36 @@ def _last_usage(metadata):
 
 # Fallback model chain — tried in order when the primary model returns 503/429
 _FALLBACK_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
+    "gemini-2.5-pro",    # primary — confirmed available
+    "gemini-2.5-flash",  # lighter fallback — confirmed available
 ]
 
 def _call_with_retry(call_fn, model_name: str, max_retries: int = 3):
     """
     Call call_fn(model) with exponential back-off on 503/429.
-    Falls back through _FALLBACK_MODELS if the chosen model stays unavailable.
+    Falls back through _FALLBACK_MODELS on 404 (model not found) or sustained 503.
     call_fn must accept a single model-name string and return the response.
     """
     candidates = [model_name] + [m for m in _FALLBACK_MODELS if m != model_name]
+    last_exc = None
     for model in candidates:
         for attempt in range(max_retries):
             try:
                 return call_fn(model)
             except Exception as e:
                 msg = str(e)
+                last_exc = e
+                # Transient errors — back-off and retry same model
                 if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    wait = 2 ** attempt          # 1s, 2s, 4s
-                    time.sleep(wait)
+                    time.sleep(2 ** attempt)
                     if attempt == max_retries - 1:
-                        break                    # try next model
+                        break   # exhausted retries → try next model
+                # Model not found / no access → skip to next model immediately
+                elif "404" in msg or "NOT_FOUND" in msg or "not found" in msg.lower():
+                    break
                 else:
-                    raise                        # non-retryable — re-raise immediately
-    raise RuntimeError(f"All models unavailable after retries: {candidates}")
+                    raise   # non-retryable, unknown error — re-raise
+    raise last_exc or RuntimeError(f"All models unavailable: {candidates}")
 
 def calculate_gemini_cost(prompt_tokens: int, output_tokens: int, model_name: str) -> float:
     """
@@ -346,10 +351,16 @@ def generate_narrative(source_data: dict, focus: str = None, _progress_ph=None) 
               [Sn+1] Click/engagement efficiency — CPC or CTR across all relevant platforms
 
             BREAKDOWNS (1 slide each — cover all that have data):
-              [Sn] Creative format breakdown — CTR or spend by creative format (video vs static vs carousel etc)
-              [Sn] Device breakdown — spend or CTR by device (mobile vs desktop vs tablet vs CTV)
-              [Sn] State/geo breakdown — spend or impressions by state
-              [Sn] Tactic breakdown — prospecting vs retargeting vs lookalike performance
+              The source_data["breakdowns"] dict contains: by_platform, by_objective, by_media_type (format),
+              by_ad_format (ad_type), by_geography (geo_target), by_publisher, by_buy_type, by_tactic (audience_segment),
+              by_environment. Use the actual keys present — do not fabricate breakdowns that aren't in the data.
+              Each breakdown entry has: value, spend, impressions, clicks, cpm, ctr, spend_share_pct.
+              [Sn] Media type / format breakdown — CTR or spend by format (video vs static vs carousel etc) → use by_media_type or by_ad_format
+              [Sn] Environment/device breakdown — spend or CTR by environment (desktop vs mobile vs CTV etc) → use by_environment
+              [Sn] Geo breakdown — spend or impressions by geo target / state → use by_geography
+              [Sn] Tactic / audience breakdown — prospecting vs retargeting vs lookalike performance → use by_tactic
+              [Sn] Objective breakdown — spend split by campaign objective → use by_objective
+              [Sn] Publisher breakdown — spend or CPM by publisher → use by_publisher
 
             BENCHMARK COMPARISON (1-2 slides):
               [Sn] Platform actuals vs benchmarks — CPM, CTR, CPC side by side
@@ -443,46 +454,34 @@ def generate_narrative(source_data: dict, focus: str = None, _progress_ph=None) 
 def _resolve_data_context(user_prompt: str) -> dict:
     """
     Parse client name + date range from the prompt, fetch real BigQuery performance data.
+    Uses the same smart year inference as _parse_date_range_from_question so that
+    "mazda for 2026" doesn't resolve to full-year 2026 when data only runs to May.
     Always uses live BigQuery — no mock fallback.
     """
-    import calendar as _cal, datetime as _dt
+    # Delegate date parsing to the BQ layer which already handles year inference correctly
+    from bigquery_data_layer import _parse_date_range_from_question, _dataset_date_bounds, _run, TABLE_ID
+    from data_layer import get_campaigns_for_client, assemble_pca_data as _assemble
+
+    start_date, end_date = _parse_date_range_from_question(user_prompt)
+
+    # Cap end date at the dataset's actual max so we don't query into the future
+    _, ds_max = _dataset_date_bounds()
+    if end_date > ds_max:
+        end_date = ds_max
+
+    # ── Match client name directly from BQ (no build_live_clients call) ────────
+    try:
+        df_clients = _run(f"SELECT DISTINCT client FROM {TABLE_ID} WHERE spend > 0 ORDER BY client")
+        all_clients = df_clients["client"].tolist()
+    except Exception:
+        all_clients = []
 
     pl = user_prompt.lower()
-
-    # ── Date range ──
-    PERIOD_MAP = {
-        "january": (1, 1), "jan": (1, 1), "february": (2, 2), "feb": (2, 2),
-        "march": (3, 3), "mar": (3, 3), "april": (4, 4), "apr": (4, 4),
-        "may": (5, 5), "june": (6, 6), "jun": (6, 6), "july": (7, 7), "jul": (7, 7),
-        "august": (8, 8), "aug": (8, 8), "september": (9, 9), "sep": (9, 9),
-        "october": (10, 10), "oct": (10, 10), "november": (11, 11), "nov": (11, 11),
-        "december": (12, 12), "dec": (12, 12),
-        "q1": (1, 3), "q2": (4, 6), "q3": (7, 9), "q4": (10, 12),
-        "h1": (1, 6), "h2": (7, 12),
-    }
-    start_m, end_m = 1, 12
-    for key, (sm, em) in PERIOD_MAP.items():
-        if key in pl:
-            start_m, end_m = sm, em
-            break
-
-    _year = _dt.date.today().year
-    # Default to current year; if 2025 explicitly mentioned, use that
-    if "2025" in pl:
-        _year = 2025
-    start_date = f"{_year}-{start_m:02d}-01"
-    end_date   = f"{_year}-{end_m:02d}-{_cal.monthrange(_year, end_m)[1]}"
-
-    # ── BigQuery path ─────────────────────────────────────────────────────────
-    from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data as _assemble
-    from data_layer import get_live_clients
-
-    live_clients = get_live_clients()
     matched_cid = matched_name = None
-    for cid, cdata in live_clients.items():
-        if cdata["name"].lower() in pl or cid.lower() in pl:
-            matched_cid  = cid
-            matched_name = cdata["name"]
+    for cname in all_clients:
+        if cname.lower() in pl:
+            matched_cid  = cname
+            matched_name = cname
             break
 
     if not matched_cid:
@@ -490,7 +489,8 @@ def _resolve_data_context(user_prompt: str) -> dict:
                 "date_range": f"{start_date} → {end_date}", "campaigns": []}
 
     camps = get_campaigns_for_client(matched_cid, start_date, end_date)
-    real_camps = [c for c in camps if not c["campaign_id"].endswith("_all")][:3]
+    # Filter out the synthetic "All Campaigns" entry
+    real_camps = [c for c in camps if c["campaign_id"] != "bq_all_campaigns"][:3]
 
     if not real_camps:
         return {"resolved": False, "client_name": matched_name,
@@ -536,23 +536,28 @@ def generate_quick_slides(user_prompt: str) -> dict:
             if ctx["resolved"]:
                 data_section = (
                     f"CLIENT: {ctx['client_name']}  |  PERIOD: {ctx['date_range']}\n\n"
-                    f"You have FULL performance data below — real spend, impressions, CPM, CTR, CPC, "
-                    f"CPCV, weekly trends, creative breakdowns, device splits, geo splits, and benchmarks. "
-                    f"Use these exact numbers in your bullets and chart_data.\n\n"
+                    f"You have FULL campaign performance data below — real spend, impressions, CPM, CTR, "
+                    f"CPC, CPCV, weekly trends, and taxonomy breakdowns. Use exact numbers in bullets.\n\n"
                     f"{json.dumps(ctx['campaigns'], default=str)}"
                 )
                 data_note = (
                     "The data includes: overview (platform-level totals), weekly_trends, "
-                    "breakdowns (by creative format, device, state, tactic), benchmarks, and raw rows. "
-                    "Pull specific CPM, CTR, CPC, impression, and spend figures directly from it."
+                    "breakdowns by: objective, format/media type, geo_target, publisher_name, "
+                    "audience_segment/tactic, ad_type, buy_type, and environment. "
+                    "Also includes benchmarks. Pull specific CPM, CTR, CPC, spend and impression "
+                    "figures directly from the data — never make up numbers."
                 )
             else:
                 from data_layer import get_qa_context
                 _ctx_data = get_qa_context(user_prompt)
                 data_section = json.dumps(_ctx_data, default=str)
                 data_note = (
-                    "This is live BigQuery portfolio data (spend by client/platform/objective). "
-                    "Use it to estimate and reason about performance."
+                    "This is live BigQuery portfolio data. Available breakdowns: by_client_platform "
+                    "(spend/impressions/CPM/CTR/CPC by client+platform), weekly_by_client, "
+                    "monthly_by_client_platform, by_objective, by_format, by_geo (geo_target), "
+                    "by_publisher (publisher_name), by_audience_segment, by_ad_type, by_buy_type. "
+                    "Use these breakdowns to answer questions about objective mix, format performance, "
+                    "geo distribution, publisher spend, audience tactics, and buy type efficiency."
                 )
 
             prompt = f"""You are a senior media analyst. A user has requested:
@@ -727,19 +732,54 @@ def answer_question_with_llm(query: str, chat_history: list = None) -> dict:
 
             client = _gemini_client()
 
-            # Build dataset context — always BigQuery
+            # Build dataset context — always BigQuery (date-aware)
             from data_layer import get_qa_context
             _dataset = get_qa_context(query)
-            _dataset["source"] = "BigQuery · res-apac-dev-skynet-au · resodigital_MelbUnified.all_clients_unified"
+            _period      = _dataset.get("queried_period", "unknown period")
+            _full_range  = _dataset.get("dataset_full_range", "unknown")
+            _auto_exp    = _dataset.get("auto_expanded", False)
+            _avail       = _dataset.get("data_availability", {})
+            _rows        = _avail.get("rows_in_period", 0)
+            _d_min       = _avail.get("earliest_date", "N/A")
+            _d_max       = _avail.get("latest_date",   "N/A")
 
-            # Pass dataset as system_instruction to keep it out of the rolling chat window
-            system_instruction = (
-                "You are a helpful media data analyst. "
-                "Use the following client advertising dataset to answer the user's question. "
-                "DATA QUESTIONS: give direct, concise factual answers with real numbers. "
-                "INSIGHT QUESTIONS: deeper analysis highlighting trends. "
-                f"Dataset: {json.dumps(_dataset, default=str)}"
-            )
+            system_instruction = f"""You are a senior media data analyst at a media agency.
+You have LIVE data from BigQuery. Period queried: {_period}.
+Full dataset spans: {_full_range}.
+{"NOTE: The originally queried period had no data, so the query was automatically expanded to the full dataset range." if _auto_exp else ""}
+
+DATA AVAILABILITY:
+- Rows returned: {_rows:,}
+- Date range of returned rows: {_d_min} → {_d_max}
+- Full dataset range: {_full_range}
+- Source: res-apac-dev-skynet-au · resodigital_MelbUnified.all_clients_unified
+
+AVAILABLE DATA FIELDS (all in the LIVE DATA block below):
+- by_client_platform: spend, impressions, CPM, CTR, CPC, CPCV by client + platform
+- weekly_by_client / daily_detail: time-series spend and impressions
+- monthly_by_client_platform: month-by-month trends
+- by_objective: spend + impressions split by campaign objective (awareness, consideration, conversion, etc.)
+- by_format: spend + impressions by media format/type (video, display, search, social, etc.)
+- by_geo: spend + impressions by geo_target (state, national, city-level)
+- by_publisher: spend + impressions by publisher_name (Meta, Google, TikTok sub-publishers, etc.)
+- by_audience_segment: spend + impressions by audience tactic / segment
+- by_ad_type: spend + impressions by ad unit type (carousel, video, story, etc.)
+- by_buy_type: spend + impressions by buy type (CPM, CPC, CPV, programmatic, direct, etc.)
+
+ANSWERING RULES:
+1. Lead with the direct answer using EXACT numbers from the data. Never make up numbers.
+2. If rows_returned=0, say: "I couldn't find data for that exact period. The dataset runs from {_full_range}. Here's what I can tell you for the available period:" then summarise the full dataset context.
+3. If the query was auto-expanded, mention it naturally: "I didn't find data for [original period] so I'm showing you the full available dataset instead."
+4. Format currency as $X,XXX or $X.XM. Impressions as X.XM or X,XXX,XXX.
+5. For time questions (last week, yesterday) use weekly_by_client or daily_detail fields.
+6. For objective/format/geo/publisher/audience questions, use the matching by_* breakdown.
+7. Use bullet points for breakdowns. **Bold** key numbers and client names.
+8. End with one "→ So what:" insight line.
+9. If a client isn't found, name the clients that ARE in the data.
+10. Never say "I don't have access" — you have live data. Say "no data found for this period" if needed.
+
+LIVE DATA:
+{json.dumps(_dataset, default=str)}"""
 
             contents = []
             for msg in chat_history:
@@ -1031,3 +1071,166 @@ def _mock_media_strategy(client_name: str, error: str = None) -> dict:
         "risks_and_mitigations": [],
         "_metadata": {"cost": 0.0, "tokens": 0}
     }
+
+
+# ─── Weekly Meet generator ─────────────────────────────────────────────────────
+
+def generate_weekly_meet(data: dict, client_name: str) -> dict:
+    """
+    Generate a Weekly Meet / WIP meeting brief from weekly BQ data.
+
+    Returns a structured JSON with:
+      headline, overall_summary, channels (per-platform), next_week_actions, talking_points
+    """
+    def _mock(reason=""):
+        return {
+            "_error": bool(reason),
+            "_error_msg": reason,
+            "_metadata": {"cost": 0.0, "tokens": 0},
+            "headline": "Weekly performance summary",
+            "overall_summary": "Enable LLM in sidebar settings to generate a full Weekly Meet brief.",
+            "channels": [
+                {
+                    "platform": r["platform"],
+                    "status": "on_track",
+                    "summary": f"${r['spend']:,.0f} spend · {r['impressions']:,} imps",
+                    "wow_note": "WoW data available — enable LLM for narrative.",
+                    "recommendation": "Enable LLM for recommendations.",
+                }
+                for r in data.get("this_week", [])
+            ],
+            "next_week_actions": [
+                {"priority": "—", "platform": "All", "action": "Enable LLM for next-week recommendations.", "rationale": ""}
+            ],
+            "talking_points": [
+                {"topic": "Overall delivery", "context": "See channel table below.", "suggested_question": "How did we track vs plan this week?"}
+            ],
+        }
+
+    if not st.session_state.get("settings_llm_enabled", False):
+        return _mock()
+
+    provider   = st.session_state.get("settings_llm_provider")
+    model_name = _model_name()
+
+    if provider != "Vertex AI (Gemini)":
+        return _mock("Provider not configured.")
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = _gemini_client()
+
+        week_start  = data.get("week_start", "")
+        week_end    = data.get("week_end", "")
+        totals      = data.get("totals", {})
+        spend_wow   = totals.get("spend_wow_pct")
+        wow_txt     = f"{spend_wow:+.1f}% WoW" if spend_wow is not None else "no prior week data"
+
+        prompt = f"""You are a senior media strategist running a Weekly WIP meeting for the client {client_name}.
+The week covered is {week_start} to {week_end}.
+Total spend this week: ${totals.get('spend', 0):,.0f}  ({wow_txt}).
+Platforms active: {totals.get('n_platforms', 0)}.
+
+Respond ONLY with a valid JSON object. No markdown fences.
+
+Your job is to generate a complete Weekly Meet brief that a media planner would use to:
+1. Summarise the week's performance channel by channel with insight-led commentary
+2. Recommend concrete actions for next week
+3. Arm the account team with talking points for the client meeting
+
+═══════════════════════════════════════
+TONE & STYLE
+═══════════════════════════════════════
+- Direct, confident, no waffle. Lead every comment with the implication, not the raw number.
+- "Meta was efficient this week — CPM held at $9.40, 12% below benchmark — but CTR dropped to 0.55%, suggesting fatigue."  ← GOOD
+- "Meta spent $45,000 with 4.7M impressions and a $9.40 CPM."  ← BAD (data dump, no insight)
+- For WoW changes, flag meaningful shifts (>10%) with a reason or hypothesis.
+- Recommendations must be specific and actionable: "Increase Google Search daily cap from $800 to $1,100" not "consider optimising Search budget".
+- Talking points should be things the client will ask about — frame them as conversation starters, not status updates.
+
+═══════════════════════════════════════
+STATUS CODES — assign one per channel:
+  "strong"    → materially beating efficiency benchmarks or plan
+  "on_track"  → within ±10% of expected pacing and efficiency
+  "watch"     → a metric is drifting — flag it, monitor next week
+  "concern"   → underdelivering or efficiency materially off — needs action
+═══════════════════════════════════════
+
+OUTPUT SCHEMA:
+{{
+    "headline": "6-10 word punchy summary of the week — the thing to say in the first 30 seconds of the meeting",
+    "overall_summary": "3-4 sentences. Total delivery, top performer, biggest issue, and one forward-looking note.",
+    "channels": [
+        {{
+            "platform": "Meta",
+            "status": "strong",
+            "summary": "2-3 sentences of insight-led commentary. What happened, why it matters, what it signals.",
+            "wow_note": "One sentence on key WoW movement (spend, CPM, CTR, or impressions — pick the most significant). Use +/-% with context.",
+            "recommendation": "One specific, actionable instruction for next week. Start with a verb (Increase / Pause / Shift / Test / Cap / etc.)"
+        }}
+    ],
+    "next_week_actions": [
+        {{
+            "priority": "HIGH",
+            "platform": "Google Search",
+            "action": "Increase daily budget cap from $800 to $1,100 — Search was impression-constrained 4 of 7 days and delivered the lowest CPC of the portfolio.",
+            "rationale": "One sentence explaining why this is the right move based on this week's data."
+        }}
+    ],
+    "talking_points": [
+        {{
+            "topic": "Meta creative fatigue",
+            "context": "CTR has declined 3 weeks in a row. This week it hit 0.55%, 35% below the 0.85% benchmark. The creative pool has not been refreshed since [date].",
+            "suggested_question": "Have you had new creative approved? We should brief a refresh this week or we'll see further efficiency loss."
+        }}
+    ],
+    "campaign_summaries": [
+        {{
+            "campaign": "Campaign description exactly as in data",
+            "status": "strong",
+            "one_liner": "One insight-led sentence — what this campaign did this week and what it means.",
+            "watch": "Optional: one thing to monitor or flag for next week. Omit if nothing notable."
+        }}
+    ]
+}}
+
+RULES:
+- Generate one channel entry per platform in this_week.
+- Generate 3-6 next_week_actions — prioritise HIGH / MEDIUM / LOW.
+- Generate 3-5 talking_points — these are the meaty client conversation topics, not housekeeping.
+- Generate one campaign_summary entry per campaign in campaigns_this_week (top 10 max). Use exact campaign names from the data.
+- All numbers in text MUST come from the data below. Never invent figures.
+- WoW comparisons: use wow[] for platform variance and spend_wow_pct in campaigns_this_week for campaign variance.
+- If a metric is null/missing, omit it from the narrative rather than guessing.
+
+DATA:
+{json.dumps(data, default=str)}
+"""
+
+        def _call(mdl):
+            return client.models.generate_content(
+                model=mdl,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=16384,
+                ),
+            ), mdl
+
+        response, model_name = _call_with_retry(_call, model_name)
+        usage = response.usage_metadata
+        cost  = calculate_gemini_cost(
+            getattr(usage, "prompt_token_count",     0),
+            getattr(usage, "candidates_token_count", 0),
+            model_name,
+        )
+        result = json.loads(response.text.replace("```json", "").replace("```", "").strip())
+        result["_metadata"] = {"cost": cost, "tokens": getattr(usage, "prompt_token_count", 0) + getattr(usage, "candidates_token_count", 0)}
+        result["_error"]    = False
+        result["_error_msg"] = ""
+        return result
+
+    except Exception as e:
+        return _mock(str(e))

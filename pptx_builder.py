@@ -759,29 +759,27 @@ def build_pptx_from_scratch(slides_json: dict, output_path: str) -> str:
 
 # ─── Slide Generator builder ───────────────────────────────────────────────────
 
-_SG_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "slide generator.pptx")
-
 def build_quick_slides_pptx(slides_json: dict, output_path: str) -> str:
     """
-    Build a PPTX from the 'slide generator.pptx' template.
+    Build a PPTX for the Slide Generator using the OMD template's chart slide
+    (index 3 — the 1/3 Layout slide) as the repeating template.
 
-    The template has a single 1/3 Layout slide (chart + left commentary).
-    We clone it once per slide in slides_json["slides"], fill content,
-    then delete the original template slide and renumber.
-
-    No cover / agenda / dividers / rec — just the content slides.
+    Clones it once per slide, fills content, then removes the original template
+    slides so only the generated content remains.
     """
-    prs = Presentation(_SG_TEMPLATE_PATH)
+    prs = Presentation(TEMPLATE_PATH)
 
-    TMPL = 0   # the single template slide
-
+    # Clone a chart slide for each output slide
     for slide_data in slides_json.get("slides", []):
-        cs = _clone_slide(prs, TMPL)
+        cs = _clone_slide(prs, TMPL_CHART)
         _fill_chart_slide(cs, slide_data)
 
-    # Delete the original template slide
-    if prs.slides:
-        _delete_slide(prs, TMPL)
+    # Remove all original template slides (cover, agenda, divider, chart, rec, callout)
+    # They are now at the front — delete from highest index down to avoid index shifts
+    n_template_slides = 6  # OMD template has 6 base slides (0-5)
+    n_to_delete = min(n_template_slides, len(prs.slides))
+    for idx in range(n_to_delete - 1, -1, -1):
+        _delete_slide(prs, idx)
 
     prs.save(output_path)
     _renumber_slides(output_path)
