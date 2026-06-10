@@ -530,23 +530,27 @@ def generate_quick_slides(user_prompt: str) -> dict:
                     f"{json.dumps(ctx['campaigns'], default=str)}"
                 )
                 data_note = (
-                    "The data includes: overview (platform-level totals), weekly_trends, "
-                    "breakdowns by: objective, format/media type, geo_target, publisher_name, "
-                    "audience_segment/tactic, ad_type, buy_type, and environment. "
-                    "Also includes benchmarks. Pull specific CPM, CTR, CPC, spend and impression "
-                    "figures directly from the data — never make up numbers."
+                    "The data is a list of campaigns. Each has: overview (platform-level totals), "
+                    "weekly_trends, benchmarks, and a breakdowns dict whose keys are exactly: "
+                    "by_platform, by_objective, by_media_type (format), by_ad_format (ad_type), "
+                    "by_geography (geo_target), by_publisher (publisher_name), by_buy_type, "
+                    "by_tactic (audience_segment), by_environment. Each breakdown row has "
+                    "value, spend, impressions, clicks, cpm, ctr, spend_share_pct. "
+                    "Pull specific CPM, CTR, CPC, spend and impression figures directly from the "
+                    "data — never make up numbers."
                 )
             else:
                 from data_layer import get_qa_context
                 _ctx_data = get_qa_context(user_prompt)
                 data_section = json.dumps(_ctx_data, default=str)
                 data_note = (
-                    "This is live BigQuery portfolio data. Available breakdowns: by_client_platform "
+                    "This is live BigQuery portfolio data. Available keys: by_client_platform "
                     "(spend/impressions/CPM/CTR/CPC by client+platform), weekly_by_client, "
                     "monthly_by_client_platform, by_objective, by_format, by_geo (geo_target), "
-                    "by_publisher (publisher_name), by_audience_segment, by_ad_type, by_buy_type. "
+                    "by_publisher (publisher_name), by_audience_segment, by_ad_type, by_buy_type, "
+                    "by_environment. "
                     "Use these breakdowns to answer questions about objective mix, format performance, "
-                    "geo distribution, publisher spend, audience tactics, and buy type efficiency."
+                    "geo distribution, publisher spend, audience tactics, buy type and environment efficiency."
                 )
 
             prompt = f"""You are a senior media analyst. A user has requested:
@@ -619,80 +623,6 @@ DATA:
     return {"slides": [], "_metadata": {"cost": 0.0, "tokens": 0}}
 
 
-def answer_benchmark_question(query: str, chat_history: list = None, context_data: dict = None) -> dict:
-    """Answer benchmark questions. context_data can contain pre-computed client vs pool comparison."""
-    if chat_history is None:
-        chat_history = []
-
-    if not st.session_state.get("settings_llm_enabled", False):
-        return {"answer": "Enable LLM in sidebar settings to use benchmark Q&A.",
-                "query_explanation": "", "cost": 0.0}
-
-    provider   = st.session_state.get("settings_llm_provider")
-    model_name = _model_name()
-
-    if provider == "Vertex AI (Gemini)":
-        try:
-            from google import genai
-            from live_analytics import get_portfolio_overview, get_portfolio_benchmarks
-
-            client = _gemini_client()
-            overview = get_portfolio_overview()
-
-            if context_data:
-                context = f"""You are a senior media benchmarking analyst.
-You have the following pre-computed benchmark comparison data:
-
-CLIENT BEING ANALYSED: {context_data.get('client_name')}
-DATE RANGE: {context_data.get('date_range')}
-
-CLIENT VS POOL COMPARISON (per platform):
-{json.dumps(context_data.get('comparison', []), default=str)}
-
-POOL ACTUALS (all other clients, per platform averages):
-{json.dumps(context_data.get('pool_averages', {}), default=str)}
-
-PORTFOLIO OVERVIEW:
-{json.dumps(overview, default=str)}
-
-Answer with: direct answer first, specific numbers, then a "so what" implication.
-For CPM/CPC: negative variance vs pool = client is more efficient (good).
-For CTR: positive variance vs pool = client has better engagement (good).
-Keep responses concise. Use bullet points.
-"""
-            else:
-                benchmarks = get_portfolio_benchmarks("all")
-                context = f"""You are a senior media benchmarking analyst at a media agency.
-Portfolio benchmark data (our actuals vs industry standards):
-{json.dumps(benchmarks, default=str)}
-
-Portfolio overview:
-{json.dumps(overview, default=str)}
-
-Answer with direct insight first, then data, then implication. Be concise.
-"""
-            contents = [{"role": "user", "parts": [{"text": context}]}]
-            for msg in chat_history:
-                role = "user" if msg["role"] == "user" else "model"
-                contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-            contents.append({"role": "user", "parts": [{"text": query}]})
-
-            def _call(mdl):
-                return client.models.generate_content(model=mdl, contents=contents), mdl
-
-            response, model_name = _call_with_retry(_call, model_name)
-            usage    = response.usage_metadata
-            cost     = calculate_gemini_cost(usage.prompt_token_count, usage.candidates_token_count, model_name)
-
-            return {"answer": response.text,
-                    "query_explanation": f"Portfolio benchmarks via {model_name}",
-                    "cost": cost}
-        except Exception as e:
-            return {"answer": f"Error: {e}", "query_explanation": "API Error", "cost": 0.0}
-
-    return {"answer": "LLM provider not configured.", "query_explanation": "", "cost": 0.0}
-
-
 def answer_question_with_llm(query: str, chat_history: list = None) -> dict:
     if chat_history is None:
         chat_history = []
@@ -754,6 +684,7 @@ AVAILABLE DATA FIELDS (all in the LIVE DATA block below):
 - by_audience_segment: spend + impressions by audience tactic / segment
 - by_ad_type: spend + impressions by ad unit type (carousel, video, story, etc.)
 - by_buy_type: spend + impressions by buy type (CPM, CPC, CPV, programmatic, direct, etc.)
+- by_environment: spend + impressions by environment (mobile, desktop, CTV, in-app, web, etc.)
 
 ANSWERING RULES:
 1. Lead with the direct answer using EXACT numbers from the data. Never make up numbers.
@@ -800,266 +731,6 @@ LIVE DATA:
             return {"answer": f"Sorry, I encountered an error: {e}", "query_explanation": "API Error", "cost": 0.0}
 
     return {"answer": "LLM provider not configured. Enable Vertex AI in ⚙️ Settings.", "query_explanation": "", "cost": 0.0}
-
-def generate_optimizations(source_data: dict) -> dict:
-    if not st.session_state.get("settings_llm_enabled", False):
-        return {"optimizations": [
-            {"id": "mock_1", "platform": "Meta", "action": "Shift $15,000 from Static to Video", "rationale": "Video is driving a 45% lower CPC across generic tactics.", "expected_impact": "Est. 1,200 additional clicks", "confidence": 0.88},
-            {"id": "mock_2", "platform": "Google Search", "action": "Decrease weekend bid modifiers by 15%", "rationale": "Weekend conversion rates drop significantly dragging down overall efficiency.", "expected_impact": "Save $4,500 with minimal impression loss", "confidence": 0.94}
-        ]}
-
-    provider = st.session_state.get("settings_llm_provider")
-    model_name = _model_name()
-
-    if provider == "Vertex AI (Gemini)":
-        try:
-            from google import genai
-            from google.genai import types
-            
-            client = _gemini_client()
-
-            prompt = f"""You are an expert AI Trading Agent analyzing the following live campaign data:
-{json.dumps(source_data.get("overview", []), default=str)}
-
-Based on performance metrics (Spend, CPM, CPC, etc), recommend 3-5 specific, highly actionable platform-level optimizations. 
-Output STRICTLY in the following JSON schema:
-{{
-  "optimizations": [
-    {{
-       "id": "opt_1",
-       "platform": "Platform Name",
-       "action": "Short descriptive action (e.g. Shift 10% budget from X to Y)",
-       "rationale": "Why this action is recommended based on the data",
-       "expected_impact": "Predicted outcome (e.g. Save $X or Gain Y clicks)",
-       "confidence": 0.85 
-    }}
-  ]
-}}
-"""
-            def _call(mdl):
-                return client.models.generate_content(
-                    model=mdl,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json")
-                ), mdl
-
-            response, model_name = _call_with_retry(_call, model_name)
-
-            try:
-                txt = response.text.strip()
-                if txt.startswith("```json"): txt = txt[7:]
-                elif txt.startswith("```"): txt = txt[3:]
-                if txt.endswith("```"): txt = txt[:-3]
-                data = json.loads(txt.strip())
-                return data
-            except Exception as e:
-                print("JSON Parsing error in optimizations:", e, response.text)
-                return {"optimizations": []}
-                
-        except Exception as e:
-            return {"error": str(e), "optimizations": []}
-
-    return {"optimizations": []}
-
-
-def generate_media_strategy(brief_text: str, client_history: dict, market_context: dict) -> dict:
-    """
-    Generate a forward-looking media strategy from a brief + client history + portfolio market context.
-    Returns structured JSON with strategy overview, channel mix, budget allocation, flight plan, insights.
-    """
-    if not st.session_state.get("settings_llm_enabled", False):
-        return _mock_media_strategy(client_history.get("client_name", "Client"))
-
-    provider = st.session_state.get("settings_llm_provider")
-    model_name = _model_name()
-
-    if provider == "Vertex AI (Gemini)":
-        try:
-            from google import genai
-            from google.genai import types
-
-            client = _gemini_client()
-
-            prompt = f"""You are a senior media strategist at a leading media agency.
-You have been given a client brief, the client's historical campaign performance data, and market benchmarks from the broader portfolio.
-Your job is to develop a comprehensive media strategy and media plan.
-
-Respond ONLY with a valid JSON object. No markdown, no ```json fences.
-
-═══════════════════════════════════════
-CLIENT BRIEF
-═══════════════════════════════════════
-{brief_text if brief_text.strip() else "No brief text could be extracted — infer objectives from client history and category norms."}
-
-═══════════════════════════════════════
-CLIENT HISTORICAL PERFORMANCE
-═══════════════════════════════════════
-{json.dumps(client_history, default=str)}
-
-═══════════════════════════════════════
-MARKET CONTEXT (portfolio benchmarks from other clients we run)
-═══════════════════════════════════════
-{json.dumps(market_context, default=str)}
-
-═══════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════
-Return this exact JSON structure:
-{{
-  "client_name": "...",
-  "strategy_headline": "One punchy sentence summarising the strategic approach",
-  "executive_summary": "2-3 sentences: what the brief is asking for, what the strategy does, and the single biggest opportunity",
-  "brief_summary": {{
-    "objectives": ["Primary objective", "Secondary objective"],
-    "target_audience": "Description of the target audience",
-    "key_messages": ["Key message 1", "Key message 2"],
-    "campaign_period": "e.g. Q1-Q2 FY26 or full year",
-    "budget_indication": "e.g. $2.5M estimated or as briefed"
-  }},
-  "strategic_approach": {{
-    "positioning": "How we position this campaign strategically",
-    "channel_philosophy": "Why we are choosing the channel mix we are recommending",
-    "key_tensions": ["Tension or challenge 1", "Tension or challenge 2"]
-  }},
-  "channel_mix": [
-    {{
-      "channel": "e.g. Broadcast TV",
-      "platforms": ["Seven Network", "Nine Network", "10 Network"],
-      "budget_pct": 35,
-      "role": "Mass reach and brand awareness",
-      "rationale": "Why this channel, grounded in client history or market data",
-      "past_performance": "What this channel delivered for the client historically (CPM, reach, etc.)",
-      "market_benchmark": "What we're seeing across the portfolio for this channel",
-      "recommended_formats": ["30s TVC", "15s TVC"],
-      "kpis": ["TRPs", "Reach %", "Frequency"]
-    }}
-  ],
-  "budget_allocation": [
-    {{"channel": "Broadcast TV", "pct": 35, "est_spend": "$875,000"}},
-    {{"channel": "Digital Video", "pct": 20, "est_spend": "$500,000"}},
-    {{"channel": "Social", "pct": 18, "est_spend": "$450,000"}},
-    {{"channel": "Search", "pct": 12, "est_spend": "$300,000"}},
-    {{"channel": "OOH", "pct": 10, "est_spend": "$250,000"}},
-    {{"channel": "Radio", "pct": 5, "est_spend": "$125,000"}}
-  ],
-  "monthly_flight": [
-    {{
-      "month": "Jan 2026",
-      "phase": "Launch / Awareness",
-      "activity": "Heavy TV + OOH launch burst, social seeding",
-      "channels_active": ["TV", "OOH", "Social", "Search"],
-      "relative_weight": "Heavy"
-    }}
-  ],
-  "market_insights": [
-    {{
-      "insight": "A specific market observation from the portfolio data",
-      "implication": "What this means for this client's plan"
-    }}
-  ],
-  "past_campaign_learnings": [
-    {{
-      "learning": "Specific finding from the client's historical campaigns",
-      "applied_as": "How this learning has been applied to the new plan"
-    }}
-  ],
-  "recommendations": [
-    {{
-      "priority": "HIGH",
-      "recommendation": "Specific, actionable recommendation",
-      "rationale": "Why, grounded in data"
-    }}
-  ],
-  "risks_and_mitigations": [
-    {{
-      "risk": "A potential risk to the plan",
-      "mitigation": "How to mitigate it"
-    }}
-  ]
-}}
-
-IMPORTANT:
-- channel_mix should cover 5-8 channels appropriate for this client and category
-- monthly_flight should cover every month of the campaign period (6-12 months)
-- market_insights should come from the portfolio benchmark data provided — be specific
-- past_campaign_learnings must reference actual numbers from the client history data
-- budget_allocation percentages must sum to 100
-- All est_spend values should be consistent with each other and the total budget
-- Be specific and data-grounded — avoid generic platitudes
-"""
-
-            def _call(mdl):
-                return client.models.generate_content(
-                    model=mdl,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(max_output_tokens=16384)
-                ), mdl
-
-            response, model_name = _call_with_retry(_call, model_name)
-
-            usage = response.usage_metadata
-            cost = calculate_gemini_cost(
-                getattr(usage, "prompt_token_count", 0),
-                getattr(usage, "candidates_token_count", 0),
-                model_name
-            )
-
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            result = json.loads(text)
-            result["_metadata"] = {"cost": cost, "tokens": getattr(usage, "total_token_count", 0), "model": model_name}
-            return result
-
-        except Exception as e:
-            return _mock_media_strategy(client_history.get("client_name", "Client"), error=str(e))
-
-    return _mock_media_strategy(client_history.get("client_name", "Client"), error="Provider not configured.")
-
-
-def _mock_media_strategy(client_name: str, error: str = None) -> dict:
-    return {
-        "_error": error,
-        "_metadata": {"cost": 0.0, "tokens": 0, "model": "mock"},
-        "client_name": client_name,
-        "strategy_headline": "Integrated, data-led campaign across broadcast and digital touchpoints",
-        "executive_summary": "Based on historical performance and market benchmarks, this strategy recommends a balanced channel mix prioritising mass reach via TV, amplified by targeted digital video and performance search.",
-        "brief_summary": {
-            "objectives": ["Drive brand awareness", "Generate qualified leads"],
-            "target_audience": "Adults 25-54, household decision-makers",
-            "key_messages": ["Brand message 1", "Brand message 2"],
-            "campaign_period": "FY26 full year",
-            "budget_indication": "TBD"
-        },
-        "strategic_approach": {
-            "positioning": "Category leadership through integrated reach",
-            "channel_philosophy": "TV builds reach, digital converts it",
-            "key_tensions": ["Balancing brand vs performance investment", "National vs state-weighted activity"]
-        },
-        "channel_mix": [
-            {"channel": "Broadcast TV", "platforms": ["Seven", "Nine", "10"], "budget_pct": 35,
-             "role": "Mass reach", "rationale": "Highest reach channel in category", "past_performance": "See client history",
-             "market_benchmark": "Avg CPM $28-30 across portfolio", "recommended_formats": ["30s TVC"], "kpis": ["TRPs", "Reach%"]},
-            {"channel": "Social", "platforms": ["Meta", "TikTok"], "budget_pct": 25,
-             "role": "Engagement and retargeting", "rationale": "Strong CTR from previous campaigns", "past_performance": "See client history",
-             "market_benchmark": "Meta CPM $9-12 across portfolio", "recommended_formats": ["Video 15s", "Carousel"], "kpis": ["CPM", "CTR", "VTR"]}
-        ],
-        "budget_allocation": [
-            {"channel": "Broadcast TV", "pct": 35, "est_spend": "TBD"},
-            {"channel": "Social", "pct": 25, "est_spend": "TBD"},
-            {"channel": "Search", "pct": 20, "est_spend": "TBD"},
-            {"channel": "Digital Video", "pct": 10, "est_spend": "TBD"},
-            {"channel": "OOH", "pct": 10, "est_spend": "TBD"}
-        ],
-        "monthly_flight": [
-            {"month": m, "phase": "Campaign Activity", "activity": "Placeholder — enable LLM for full plan",
-             "channels_active": ["TV", "Social", "Search"], "relative_weight": "Medium"}
-            for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        ],
-        "market_insights": [{"insight": "Enable LLM for market insights", "implication": "N/A"}],
-        "past_campaign_learnings": [{"learning": "Enable LLM for learnings", "applied_as": "N/A"}],
-        "recommendations": [{"priority": "HIGH", "recommendation": "Enable LLM for recommendations", "rationale": "N/A"}],
-        "risks_and_mitigations": [],
-        "_metadata": {"cost": 0.0, "tokens": 0}
-    }
 
 
 # ─── Weekly Meet generator ─────────────────────────────────────────────────────
@@ -1117,8 +788,19 @@ def generate_weekly_meet(data: dict, client_name: str) -> dict:
         spend_wow   = totals.get("spend_wow_pct")
         wow_txt     = f"{spend_wow:+.1f}% WoW" if spend_wow is not None else "no prior week data"
 
+        scope        = data.get("scope", "client")
+        campaign_nm  = data.get("campaign", "All Campaigns")
+        if scope == "campaign":
+            scope_line  = f'SCOPE: A SINGLE CAMPAIGN — "{campaign_nm}". Every number below is for this campaign only, not the whole client.'
+            camp_rule   = ('- This brief covers ONE campaign. In campaign_summaries, summarise the sub-lines / platforms within '
+                           'this campaign rather than other campaigns. Frame channels as channels WITHIN this campaign.')
+        else:
+            scope_line  = "SCOPE: WHOLE CLIENT — all campaigns combined."
+            camp_rule   = "- Generate one campaign_summary entry per campaign in campaigns_this_week (top 10 max). Use exact campaign names from the data."
+
         prompt = f"""You are a senior media strategist running a Weekly WIP meeting for the client {client_name}.
 The week covered is {week_start} to {week_end}.
+{scope_line}
 Total spend this week: ${totals.get('spend', 0):,.0f}  ({wow_txt}).
 Platforms active: {totals.get('n_platforms', 0)}.
 
@@ -1189,10 +871,21 @@ RULES:
 - Generate one channel entry per platform in this_week.
 - Generate 3-6 next_week_actions — prioritise HIGH / MEDIUM / LOW.
 - Generate 3-5 talking_points — these are the meaty client conversation topics, not housekeeping.
-- Generate one campaign_summary entry per campaign in campaigns_this_week (top 10 max). Use exact campaign names from the data.
+{camp_rule}
 - All numbers in text MUST come from the data below. Never invent figures.
 - WoW comparisons: use wow[] for platform variance and spend_wow_pct in campaigns_this_week for campaign variance.
 - If a metric is null/missing, omit it from the narrative rather than guessing.
+
+TAXONOMY — mine these breakdowns for the sharpest talking points and actions (only those present have data):
+- by_objective      → spend/efficiency split by campaign objective (awareness, consideration, conversion…)
+- by_format         → by creative format (video, static, carousel…)
+- by_ad_type        → by ad type
+- by_buy_type       → by buy type (CPM, CPC, programmatic guaranteed…)
+- by_publisher      → by publisher / inventory source
+- by_audience       → by audience_segment (prospecting vs retargeting vs lookalike…)
+- by_geo            → by geo_target (state/region)
+- by_environment    → by environment (mobile / desktop / CTV / app…)
+Each row has: spend, impressions, clicks, cpm, ctr, spend_pct. Reference the dimension that best explains a movement — e.g. "retargeting CTR (1.4%) carried Meta while prospecting lagged (0.5%)".
 
 DATA:
 {json.dumps(data, default=str)}

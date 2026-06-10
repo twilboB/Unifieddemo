@@ -252,7 +252,7 @@ hr { border: none !important; border-top: 1px solid var(--border) !important; ma
 """, unsafe_allow_html=True)
 
 from data_layer import get_clients_in_date_range, get_campaigns_for_client, assemble_pca_data, get_portfolio_actuals
-from llm_engine import generate_narrative, answer_question_with_llm, generate_quick_slides, answer_benchmark_question, generate_weekly_meet
+from llm_engine import generate_narrative, answer_question_with_llm, generate_quick_slides, generate_weekly_meet
 from excel_builder import build_pca_workbook
 from pptx_builder import build_pptx_from_template, build_quick_slides_pptx
 
@@ -1739,7 +1739,7 @@ elif mode == "📅 Weekly Meet":
     import plotly.express as _wpx
     import plotly.graph_objects as _wgo
     from datetime import timedelta as _wdelta
-    from bigquery_data_layer import _run as _wq, TABLE_ID as _WT, get_weekly_meet_data
+    from bigquery_data_layer import _run as _wq, TABLE_ID as _WT, get_weekly_meet_data, get_campaigns as _wm_get_campaigns
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -1773,6 +1773,33 @@ elif mode == "📅 Weekly Meet":
         wm_es = wm_end.strftime("%Y-%m-%d")
         st.caption(f"{wm_ss} → {wm_es}  •  prev: {(wm_start - _wdelta(days=7)).strftime('%m/%d')} → {(wm_start - _wdelta(days=1)).strftime('%m/%d')}")
 
+        # ── Campaign scope ────────────────────────────────────────────────────
+        st.markdown("##### Scope")
+
+        @st.cache_data(show_spinner=False, ttl=300)
+        def _wm_campaigns(client_id, start, end):
+            try:
+                return _wm_get_campaigns(client_id, start, end)
+            except Exception:
+                return []
+
+        _WHOLE_CLIENT = "📊 Whole client (all campaigns)"
+        _wm_camps = _wm_campaigns(wm_client, wm_ss, wm_es)
+        # Real campaigns active this week (exclude synthetic All-Campaigns entry)
+        _wm_real_camps = [c for c in _wm_camps if c.get("campaign_id") != "bq_all_campaigns"]
+        _wm_camp_map = {_WHOLE_CLIENT: "all"}
+        for c in _wm_real_camps:
+            _wm_camp_map[c["campaign_name"]] = c["campaign_id"]
+
+        wm_camp_label = st.selectbox(
+            "Campaign", list(_wm_camp_map.keys()),
+            label_visibility="collapsed", key="wm_campaign",
+            help="Pick a single campaign to scope the whole brief to it, or keep Whole client.",
+        )
+        wm_camp_id = _wm_camp_map[wm_camp_label]
+        if not _wm_real_camps:
+            st.caption("No individual campaigns ran this week — showing whole client.")
+
         st.markdown("---")
         wm_gen = st.button("🗓️ Generate Brief", type="primary", use_container_width=True)
         if st.button("🗑️ Clear", use_container_width=True):
@@ -1781,12 +1808,13 @@ elif mode == "📅 Weekly Meet":
             st.rerun()
 
     # ── Header ────────────────────────────────────────────────────────────────
+    _wm_scope_txt = "All campaigns" if wm_camp_id == "all" else wm_camp_label
     st.markdown(f"""<div class="main-header">
         <h1>📅 Weekly Meet</h1>
-        <p>{wm_client}  •  {wm_ss} → {wm_es}  •  WIP meeting brief</p>
+        <p>{wm_client}  •  {_wm_scope_txt}  •  {wm_ss} → {wm_es}  •  WIP meeting brief</p>
     </div>""", unsafe_allow_html=True)
 
-    _wm_key = (wm_client, wm_ss, wm_es)
+    _wm_key = (wm_client, wm_ss, wm_es, wm_camp_id)
 
     if wm_gen:
         if st.session_state.get("wm_client_key") == _wm_key and "wm_brief" in st.session_state:
@@ -1796,7 +1824,7 @@ elif mode == "📅 Weekly Meet":
             st.session_state.pop("wm_brief", None)
 
             with st.spinner("Pulling weekly data from BigQuery…"):
-                _wm_raw = get_weekly_meet_data(wm_client, wm_ss, wm_es)
+                _wm_raw = get_weekly_meet_data(wm_client, wm_ss, wm_es, wm_camp_id)
             st.session_state["wm_data"] = _wm_raw
 
             with st.spinner("Generating meeting brief with Gemini…"):
@@ -2136,7 +2164,7 @@ elif mode == "📅 Weekly Meet":
 
     # ── TAB 5: Raw Data ────────────────────────────────────────────────────────
     with wm_t5:
-        _rd1, _rd2 = st.tabs(["This Week vs Last Week", "Top Campaigns"])
+        _rd1, _rd2, _rd3 = st.tabs(["This Week vs Last Week", "Top Campaigns", "Taxonomy"])
 
         with _rd1:
             # Merge this_week + last_week + wow into one table
@@ -2192,10 +2220,46 @@ elif mode == "📅 Weekly Meet":
             else:
                 st.info("No campaign data found for this week.")
 
+        with _rd3:
+            st.caption("Spend & efficiency split across the full media taxonomy for this week.")
+            _tax_tabs = [
+                ("Objective",   "by_objective",      "objective"),
+                ("Format",      "by_format",         "format"),
+                ("Ad Type",     "by_ad_type",        "ad_type"),
+                ("Buy Type",    "by_buy_type",       "buy_type"),
+                ("Publisher",   "by_publisher",      "publisher_name"),
+                ("Audience",    "by_audience",       "audience_segment"),
+                ("Geo",         "by_geo",            "geo_target"),
+                ("Environment", "by_environment",    "environment"),
+            ]
+            _present = [(lbl, key, dim) for lbl, key, dim in _tax_tabs if _wm_d.get(key)]
+            if not _present:
+                st.info("No taxonomy breakdowns available for this week.")
+            else:
+                for _tlbl, _tkey, _tdim in _present:
+                    _tdf = pd.DataFrame(_wm_d.get(_tkey, []))
+                    if _tdf.empty:
+                        continue
+                    st.markdown(f"**{_tlbl}**")
+                    _rename = {_tdim: _tlbl, "spend": "Spend ($)", "impressions": "Impressions",
+                               "clicks": "Clicks", "cpm": "CPM ($)", "ctr": "CTR (%)", "spend_pct": "Spend %"}
+                    _tdf = _tdf.rename(columns=_rename)
+                    st.dataframe(
+                        _tdf, use_container_width=True, hide_index=True,
+                        column_config={
+                            "Spend ($)":   st.column_config.NumberColumn("Spend ($)",   format="$%,.0f"),
+                            "Impressions": st.column_config.NumberColumn("Impressions", format="%,.0f"),
+                            "Clicks":      st.column_config.NumberColumn("Clicks",      format="%,.0f"),
+                            "CPM ($)":     st.column_config.NumberColumn("CPM ($)",     format="$%.2f"),
+                            "CTR (%)":     st.column_config.NumberColumn("CTR (%)",     format="%.3f"),
+                            "Spend %":     st.column_config.NumberColumn("Spend %",     format="%.1f%%"),
+                        }
+                    )
+
     # ── Cost / generation footnote ────────────────────────────────────────────
     _wm_tokens = _wm_b.get("_metadata", {}).get("tokens", 0)
     _wm_cost   = _wm_b.get("_metadata", {}).get("cost",   0.0)
-    _wm_model  = st.session_state.get("settings_llm_model", "gemini-2.5-pro")
+    from llm_engine import _VERTEX_MODEL as _wm_model
     st.markdown(
         f'<div style="margin-top:24px;padding:10px 16px;background:var(--border-lt);'
         f'border-radius:var(--r-sm);font-size:11px;color:var(--text-3);text-align:right;">'

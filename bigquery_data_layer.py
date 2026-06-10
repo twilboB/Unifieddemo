@@ -105,6 +105,25 @@ def _camp_where(campaign_id: str, client_id: str, start_date, end_date) -> str:
     )
     return f"AND ({safe})"
 
+def _resolve_campaign_name(campaign_id: str, client_id: str, start_date, end_date) -> str:
+    """Return the campaign_description label for a campaign id, or the id if unresolved."""
+    if campaign_id in ("all", "", None) or campaign_id == _all_campaigns_id():
+        return "All Campaigns"
+    try:
+        df = _run(f"""
+            SELECT DISTINCT COALESCE(NULLIF(TRIM(campaign_description), ''), campaign_name, 'Unknown') AS cd
+            FROM {TABLE_ID}
+            WHERE client = '{_esc(client_id)}'
+              AND {_date_where(start_date, end_date)}
+        """)
+        for _, r in df.iterrows():
+            if _camp_id(r.cd) == campaign_id:
+                return str(r.cd)
+    except Exception:
+        pass
+    return campaign_id
+
+
 def _esc(s: str) -> str:
     """Minimal SQL string escaping."""
     return str(s).replace("'", "\\'")
@@ -868,6 +887,7 @@ def get_qa_context(question: str, start_date: str | None = None, end_date: str |
     context["by_audience_segment"] = _tax_breakdown("audience_segment", "audience_segment",  60)
     context["by_ad_type"]          = _tax_breakdown("ad_type",          "ad_type",           60)
     context["by_buy_type"]         = _tax_breakdown("buy_type",         "buy_type",          40)
+    context["by_environment"]      = _tax_breakdown("environment",      "environment",       40)
 
     return context
 
@@ -1015,18 +1035,23 @@ def get_taxonomy_coverage_bq(start_date: str, end_date: str) -> dict:
 
 # ── Weekly Meet data ───────────────────────────────────────────────────────────
 
-def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict:
+def get_weekly_meet_data(client_id: str, week_start: str, week_end: str, campaign_id: str = "all") -> dict:
     """
     Pull all data needed for a Weekly Meet / WIP meeting brief.
 
+    campaign_id: pass "all" (or the all-campaigns sentinel) for the whole client,
+                 or a specific campaign id (from get_campaigns) to scope every metric
+                 to that one campaign_description.
+
     Returns:
-        client, week_start, week_end, prev_start, prev_end,
+        client, campaign, week_start, week_end, prev_start, prev_end,
         this_week  (per-platform metrics),
         last_week  (per-platform metrics for previous 7 days),
         wow        (week-on-week variance per platform),
         by_objective, by_format, by_geo, by_publisher,
+        by_audience, by_ad_type, by_buy_type, by_environment,
         top_campaigns (top 10 by spend this week),
-        daily_trend   (daily spend per platform),
+        campaigns_this_week, daily_trend,
         totals        (rolled-up summary across all platforms)
     """
     from datetime import datetime, timedelta
@@ -1035,6 +1060,15 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
     we = datetime.strptime(week_end,   "%Y-%m-%d")
     prev_end   = (ws - timedelta(days=1)).strftime("%Y-%m-%d")
     prev_start = (ws - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # Campaign scope — empty clause for whole client, otherwise an AND (...) filter.
+    # Resolve the description over the full prev→current window so it matches both weeks.
+    if campaign_id in ("all", "", None) or campaign_id == _all_campaigns_id():
+        camp_clause   = ""
+        campaign_name = "All Campaigns"
+    else:
+        camp_clause   = _camp_where(campaign_id, client_id, prev_start, week_end)
+        campaign_name = _resolve_campaign_name(campaign_id, client_id, prev_start, week_end)
 
     def _plat(start, end):
         try:
@@ -1053,6 +1087,7 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
                 WHERE client = '{_esc(client_id)}'
                   AND date BETWEEN '{start}' AND '{end}'
                   AND spend > 0
+                  {camp_clause}
                 GROUP BY platform
                 ORDER BY spend DESC
             """)
@@ -1111,6 +1146,7 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
                   AND spend > 0
                   AND {field} IS NOT NULL
                   AND TRIM(CAST({field} AS STRING)) != ''
+                  {camp_clause}
                 GROUP BY {field}
                 ORDER BY spend DESC
                 LIMIT {limit}
@@ -1131,10 +1167,14 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
             for _, r in df2.iterrows()
         ]
 
-    by_objective = _breakdown("objective",      "objective")
-    by_format    = _breakdown("format",          "format")
-    by_geo       = _breakdown("geo_target",      "geo_target")
-    by_publisher = _breakdown("publisher_name",  "publisher_name")
+    by_objective   = _breakdown("objective",        "objective")
+    by_format      = _breakdown("format",           "format")
+    by_geo         = _breakdown("geo_target",       "geo_target")
+    by_publisher   = _breakdown("publisher_name",   "publisher_name")
+    by_audience    = _breakdown("audience_segment", "audience_segment")
+    by_ad_type     = _breakdown("ad_type",          "ad_type")
+    by_buy_type    = _breakdown("buy_type",         "buy_type")
+    by_environment = _breakdown("environment",      "environment")
 
     # Campaign-level summary by campaign_description — this week + previous week for WoW
     def _camp_week(start, end, limit=60):
@@ -1152,6 +1192,7 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
                 WHERE client = '{_esc(client_id)}'
                   AND date BETWEEN '{start}' AND '{end}'
                   AND spend > 0
+                  {camp_clause}
                 GROUP BY 1
                 ORDER BY spend DESC
                 LIMIT {limit}
@@ -1202,6 +1243,7 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
             WHERE client = '{_esc(client_id)}'
               AND date BETWEEN '{week_start}' AND '{week_end}'
               AND spend > 0
+              {camp_clause}
             GROUP BY 1, 2
             ORDER BY 1, 2
         """)
@@ -1229,18 +1271,25 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
     }
 
     return {
-        "client":       client_id,
-        "week_start":   week_start,
-        "week_end":     week_end,
-        "prev_start":   prev_start,
-        "prev_end":     prev_end,
-        "this_week":    this_week,
-        "last_week":    last_week,
-        "wow":          wow,
-        "by_objective": by_objective,
-        "by_format":    by_format,
-        "by_geo":       by_geo,
-        "by_publisher": by_publisher,
+        "client":        client_id,
+        "campaign":      campaign_name,
+        "campaign_id":   campaign_id,
+        "scope":         "campaign" if camp_clause else "client",
+        "week_start":    week_start,
+        "week_end":      week_end,
+        "prev_start":    prev_start,
+        "prev_end":      prev_end,
+        "this_week":     this_week,
+        "last_week":     last_week,
+        "wow":           wow,
+        "by_objective":  by_objective,
+        "by_format":     by_format,
+        "by_geo":        by_geo,
+        "by_publisher":  by_publisher,
+        "by_audience":   by_audience,
+        "by_ad_type":    by_ad_type,
+        "by_buy_type":   by_buy_type,
+        "by_environment": by_environment,
         "top_campaigns":       top_campaigns,
         "campaigns_this_week": campaigns_this_week,
         "daily_trend":         daily_trend,
