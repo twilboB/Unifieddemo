@@ -303,6 +303,7 @@ def _load_dashboard_data(client_id, camp_id, camp_start, camp_end, ch):
 # ═══════════════════════════════════════
 DEFAULT_SETTINGS = {
     "settings_llm_enabled": True,
+    "settings_llm_provider": "Vertex AI (Gemini)",
     "settings_channel_filter": "All Channels (Online + Offline)"
 }
 
@@ -575,37 +576,42 @@ elif mode == "📊 Build PCA":
     if not gen and "pca_result" not in st.session_state:
         # ── Campaign preview (live BQ) ────────────────────────────────────────
         @st.cache_data(show_spinner=False, ttl=300)
-        def _pca_preview_bq(client_id, start, end):
-            from bigquery_data_layer import _run as _pr, TABLE_ID as _PT
+        def _pca_preview_bq(client_id, campaign_id, start, end):
+            from bigquery_data_layer import _run as _pr, TABLE_ID as _PT, _camp_where, _esc
             try:
+                camp_clause = _camp_where(campaign_id, client_id, start, end)
+                base_where = (
+                    f"WHERE client = '{_esc(client_id)}' "
+                    f"AND date BETWEEN '{start}' AND '{end}' "
+                    f"AND spend > 0 {camp_clause}"
+                )
                 row = _pr(f"""
                     SELECT SUM(spend) AS total_spend, SUM(impressions) AS impressions,
                            SUM(clicks) AS clicks, COUNT(DISTINCT platform) AS n_platforms,
                            MIN(date) AS date_min, MAX(date) AS date_max
                     FROM {_PT}
-                    WHERE client = '{client_id}' AND date BETWEEN '{start}' AND '{end}'
-                      AND spend > 0
+                    {base_where}
                 """).iloc[0]
                 plat_df = _pr(f"""
                     SELECT ARRAY_AGG(DISTINCT platform IGNORE NULLS) AS plats
                     FROM {_PT}
-                    WHERE client = '{client_id}' AND date BETWEEN '{start}' AND '{end}'
-                      AND spend > 0
+                    {base_where}
                 """).iloc[0]
+                _plats_arr = plat_df.plats
                 return {
-                    "spend":     float(row.total_spend or 0),
-                    "imps":      int(row.impressions or 0),
-                    "clicks":    int(row.clicks or 0),
-                    "n_platforms": int(row.n_platforms or 0),
-                    "date_min":  str(row.date_min)[:10] if row.date_min else start,
-                    "date_max":  str(row.date_max)[:10] if row.date_max else end,
-                    "platforms": list(plat_df.plats) if plat_df.plats else [],
+                    "spend":     float(row.total_spend) if pd.notna(row.total_spend) else 0.0,
+                    "imps":      int(row.impressions) if pd.notna(row.impressions) else 0,
+                    "clicks":    int(row.clicks) if pd.notna(row.clicks) else 0,
+                    "n_platforms": int(row.n_platforms) if pd.notna(row.n_platforms) else 0,
+                    "date_min":  str(row.date_min)[:10] if pd.notna(row.date_min) else start,
+                    "date_max":  str(row.date_max)[:10] if pd.notna(row.date_max) else end,
+                    "platforms": list(_plats_arr) if _plats_arr is not None and len(_plats_arr) > 0 else [],
                 }
             except Exception:
                 return {}
 
         with st.spinner("Loading campaign preview…"):
-            _prev = _pca_preview_bq(sci, sc["start"], sc["end"])
+            _prev = _pca_preview_bq(sci, sc["campaign_id"], sc["start"], sc["end"])
 
         _spend    = _prev.get("spend", 0)
         _imps     = _prev.get("imps", 0)
