@@ -225,11 +225,11 @@ def assemble_pca_data(
 
     overview = []
     for _, r in ov.iterrows():
-        sp = float(r.total_spend or 0)
-        im = int(r.total_impressions or 0)
-        cl = int(r.total_clicks or 0)
-        vc = int(r.total_video_completions or 0)
-        re_ = int(r.total_reach or 0)
+        sp = float(r.total_spend if pd.notna(r.total_spend) else 0)
+        im = int(r.total_impressions if pd.notna(r.total_impressions) else 0)
+        cl = int(r.total_clicks if pd.notna(r.total_clicks) else 0)
+        vc = int(r.total_video_completions if pd.notna(r.total_video_completions) else 0)
+        re_ = int(r.total_reach if pd.notna(r.total_reach) else 0)
         overview.append({
             "platform":              r.platform,
             "channel_type":          "digital",
@@ -274,14 +274,14 @@ def assemble_pca_data(
 
     campaign_lines = []
     for _, r in lines_df.iterrows():
-        sp = float(r.spend or 0)
-        im = int(r.impressions or 0)
-        cl = int(r.clicks or 0)
-        vc = float(r.video_completions or 0)
-        cv = float(r.conversions or 0)
+        sp = float(r.spend if pd.notna(r.spend) else 0)
+        im = int(r.impressions if pd.notna(r.impressions) else 0)
+        cl = int(r.clicks if pd.notna(r.clicks) else 0)
+        vc = float(r.video_completions if pd.notna(r.video_completions) else 0)
+        cv = float(r.conversions if pd.notna(r.conversions) else 0)
         campaign_lines.append({
-            "campaign_line":   str(r.campaign_line or ""),
-            "platform":        str(r.platform or ""),
+            "campaign_line":   str(r.campaign_line) if pd.notna(r.campaign_line) else "",
+            "platform":        str(r.platform) if pd.notna(r.platform) else "",
             "channel_type":    "digital",
             "geo":             str(r.geo or ""),
             "media_type":      str(r.media_type or ""),
@@ -321,8 +321,8 @@ def assemble_pca_data(
     for _, r in wk.iterrows():
         wk_s = str(r.week_start)[:10]
         pl   = r.platform
-        sp   = float(r.spend or 0)
-        im   = int(r.impressions or 0)
+        sp   = float(r.spend if pd.notna(r.spend) else 0)
+        im   = int(r.impressions if pd.notna(r.impressions) else 0)
         pr   = prev.get(pl, {})
         wow  = round((sp - pr.get("spend", sp)) / max(pr.get("spend", sp), 1) * 100, 1) if pr else 0
         weekly.append({
@@ -353,14 +353,14 @@ def assemble_pca_data(
 
     monthly = []
     for _, r in mo.iterrows():
-        sp = float(r.spend or 0)
-        im = int(r.impressions or 0)
+        sp = float(r.spend if pd.notna(r.spend) else 0)
+        im = int(r.impressions if pd.notna(r.impressions) else 0)
         monthly.append({
             "month":       str(r.month),
             "platform":    r.platform,
             "spend":       round(sp, 2),
             "impressions": im,
-            "clicks":      int(r.clicks or 0),
+            "clicks":      int(r.clicks if pd.notna(r.clicks) else 0),
             "cpm":         round(sp / max(im, 1) * 1000, 2) if im > 0 else None,
         })
 
@@ -387,14 +387,14 @@ def assemble_pca_data(
         return [
             {
                 "value":           str(r.val),
-                "spend":           round(float(r.spend or 0), 2),
-                "impressions":     int(r.impressions or 0),
-                "clicks":          int(r.clicks or 0),
-                "cpm":             round(float(r.spend or 0) / max(int(r.impressions or 1), 1) * 1000, 2)
-                                   if (r.impressions or 0) > 0 else None,
-                "ctr":             round(int(r.clicks or 0) / max(int(r.impressions or 1), 1) * 100, 3)
-                                   if (r.impressions or 0) > 0 else None,
-                "spend_share_pct": round(float(r.spend or 0) / max(total, 1) * 100, 1),
+                "spend":           round(float(r.spend if pd.notna(r.spend) else 0), 2),
+                "impressions":     int(r.impressions if pd.notna(r.impressions) else 0),
+                "clicks":          int(r.clicks if pd.notna(r.clicks) else 0),
+                "cpm":             round(float(r.spend if pd.notna(r.spend) else 0) / max(int(r.impressions if pd.notna(r.impressions) else 1), 1) * 1000, 2)
+                                   if pd.notna(r.impressions) and r.impressions > 0 else None,
+                "ctr":             round(int(r.clicks if pd.notna(r.clicks) else 0) / max(int(r.impressions if pd.notna(r.impressions) else 1), 1) * 100, 3)
+                                   if pd.notna(r.impressions) and r.impressions > 0 else None,
+                "spend_share_pct": round(float(r.spend if pd.notna(r.spend) else 0) / max(total, 1) * 100, 1),
             }
             for _, r in df2.iterrows()
         ]
@@ -505,10 +505,10 @@ def get_portfolio_actuals(start_date, end_date, channel_filter: str = "all") -> 
     for client, grp in df.groupby("client"):
         plats: dict[str, dict] = {}
         for _, r in grp.iterrows():
-            sp = float(r.spend or 0)
-            im = int(r.impressions or 0)
-            cl = int(r.clicks or 0)
-            vc = float(r.video_completions or 0)
+            sp = float(r.spend if pd.notna(r.spend) else 0)
+            im = int(r.impressions if pd.notna(r.impressions) else 0)
+            cl = int(r.clicks if pd.notna(r.clicks) else 0)
+            vc = float(r.video_completions if pd.notna(r.video_completions) else 0)
             plats[r.platform] = {
                 "channel": "digital",
                 "spend":   round(sp, 2),
@@ -558,7 +558,7 @@ def build_live_clients() -> dict:
                 "end":               str(r.end_date)[:10],
                 "platforms_digital": plats,
                 "platforms_offline": [],
-                "monthly_spend":     int(float(r.total_spend or 0) / max(months, 1)) if not pd.isna(float(r.total_spend or 0) / max(months, 1)) else 0,
+                "monthly_spend":     int(float(r.total_spend if pd.notna(r.total_spend) else 0) / max(months, 1)),
             }
         live[client] = {"name": client, "category": "BigQuery Live", "campaigns": campaigns}
     return live
@@ -1206,7 +1206,7 @@ def get_weekly_meet_data(client_id: str, week_start: str, week_end: str) -> dict
             ORDER BY 1, 2
         """)
         daily_trend = [
-            {"day": str(r.day), "platform": str(r.platform), "spend": round(float(r.spend or 0), 2)}
+            {"day": str(r.day), "platform": str(r.platform), "spend": round(float(r.spend if pd.notna(r.spend) else 0), 2)}
             for _, r in dd_df.iterrows()
         ]
     except Exception:
