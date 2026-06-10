@@ -1824,14 +1824,38 @@ elif mode == "📅 Weekly Meet":
             st.session_state.pop("wm_data",  None)
             st.session_state.pop("wm_brief", None)
 
-            with st.spinner("Pulling weekly data from BigQuery…"):
-                _wm_raw = get_weekly_meet_data(wm_client, wm_ss, wm_es, wm_camp_id)
-            st.session_state["wm_data"] = _wm_raw
+            _wm_prog = st.progress(0, text="Initialising…")
+            _WM_EXPECTED_CHARS = 10_000   # typical weekly-brief JSON size (whole client)
+            _wm_t0 = time.time()
 
-            with st.spinner("Generating meeting brief with Gemini…"):
-                _wm_brief = generate_weekly_meet(_wm_raw, wm_client)
+            # Step 1 — data pull (0 → 15%)
+            _wm_prog.progress(5, text="📦 Pulling weekly data from BigQuery…")
+            _wm_raw = get_weekly_meet_data(wm_client, wm_ss, wm_es, wm_camp_id)
+            st.session_state["wm_data"] = _wm_raw
+            _wm_t1 = time.time()
+            _wm_prog.progress(15, text=f"✅ {_wm_raw.get('totals',{}).get('n_platforms',0)} platforms pulled  ({_wm_t1-_wm_t0:.1f}s)")
+
+            # Step 2 — LLM brief, streamed (15 → 100%)
+            _wm_prog.progress(16, text="🧠 Writing the brief with Gemini…")
+            _wm_llm_start = time.time()
+
+            def _wm_cb(n_chars):
+                ratio   = min(n_chars / _WM_EXPECTED_CHARS, 1.0)
+                pct     = int(16 + ratio * 82)        # 16 → 98
+                elapsed = time.time() - _wm_llm_start
+                if elapsed > 3 and n_chars > 400:
+                    rate      = n_chars / elapsed
+                    remaining = max(0, (_WM_EXPECTED_CHARS - n_chars) / rate)
+                    eta       = f"  •  ~{remaining:.0f}s left"
+                else:
+                    eta = ""
+                _wm_prog.progress(pct, text=f"🧠 Writing the brief…  {n_chars:,} chars  •  {elapsed:.0f}s{eta}")
+
+            _wm_brief = generate_weekly_meet(_wm_raw, wm_client, _progress=_wm_cb)
             st.session_state["wm_brief"]      = _wm_brief
             st.session_state["wm_client_key"] = _wm_key
+            _wm_prog.progress(100, text=f"✅ Brief ready — {time.time()-_wm_t0:.1f}s total")
+            _wm_prog.empty()
 
     # ── Empty state ───────────────────────────────────────────────────────────
     if "wm_brief" not in st.session_state:

@@ -735,9 +735,12 @@ LIVE DATA:
 
 # ─── Weekly Meet generator ─────────────────────────────────────────────────────
 
-def generate_weekly_meet(data: dict, client_name: str) -> dict:
+def generate_weekly_meet(data: dict, client_name: str, _progress=None) -> dict:
     """
     Generate a Weekly Meet / WIP meeting brief from weekly BQ data.
+
+    _progress: optional callback(n_chars) invoked as the response streams in,
+               so the UI can show a live progress bar.
 
     Returns a structured JSON with:
       headline, overall_summary, channels (per-platform), next_week_actions, talking_points
@@ -891,25 +894,33 @@ DATA:
 {json.dumps(data, default=str)}
 """
 
-        def _call(mdl):
-            return client.models.generate_content(
+        def _stream(mdl):
+            txt = ""
+            usg = None
+            for chunk in client.models.generate_content_stream(
                 model=mdl,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     max_output_tokens=16384,
                 ),
-            ), mdl
+            ):
+                if chunk.text:
+                    txt += chunk.text
+                    if callable(_progress):
+                        _progress(len(txt))
+                candidate_usage = _last_usage(getattr(chunk, "usage_metadata", None))
+                if candidate_usage:
+                    usg = candidate_usage
+            return txt, usg, mdl
 
-        response, model_name = _call_with_retry(_call, model_name)
-        usage = response.usage_metadata
-        cost  = calculate_gemini_cost(
-            getattr(usage, "prompt_token_count",     0),
-            getattr(usage, "candidates_token_count", 0),
-            model_name,
-        )
-        result = json.loads(response.text.replace("```json", "").replace("```", "").strip())
-        result["_metadata"] = {"cost": cost, "tokens": getattr(usage, "prompt_token_count", 0) + getattr(usage, "candidates_token_count", 0)}
+        full_text, usage, model_name = _call_with_retry(_stream, model_name)
+        prompt_tokens    = getattr(usage, "prompt_token_count",     0) if usage else 0
+        candidate_tokens = getattr(usage, "candidates_token_count", 0) if usage else 0
+        cost = calculate_gemini_cost(prompt_tokens, candidate_tokens, model_name)
+
+        result = json.loads(full_text.replace("```json", "").replace("```", "").strip())
+        result["_metadata"] = {"cost": cost, "tokens": prompt_tokens + candidate_tokens}
         result["_error"]    = False
         result["_error_msg"] = ""
         return result
