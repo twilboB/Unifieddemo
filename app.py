@@ -1778,8 +1778,9 @@ elif mode == "📅 Weekly Meet":
 
         @st.cache_data(show_spinner=False, ttl=300)
         def _wm_campaigns(client_id, start, end):
+            # only_active → only campaigns that actually delivered spend this week
             try:
-                return _wm_get_campaigns(client_id, start, end)
+                return _wm_get_campaigns(client_id, start, end, only_active=True)
             except Exception:
                 return []
 

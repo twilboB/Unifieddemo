@@ -146,8 +146,15 @@ def get_clients(start_date, end_date) -> list[dict]:
         return []
 
 
-def get_campaigns(client_id: str, start_date, end_date) -> list[dict]:
-    """Return list of campaign dicts with campaign_id, campaign_name, start, end."""
+def get_campaigns(client_id: str, start_date, end_date, only_active: bool = False) -> list[dict]:
+    """Return list of campaign dicts with campaign_id, campaign_name, start, end.
+
+    only_active: when True, only campaigns that actually delivered spend in the
+                 window are returned (a campaign with no spend in the period is
+                 not a valid selection for it).
+    """
+    spend_clause  = "AND spend > 0"     if only_active else ""
+    having_clause = "HAVING SUM(spend) > 0" if only_active else ""
     try:
         df = _run(f"""
             SELECT
@@ -159,7 +166,9 @@ def get_campaigns(client_id: str, start_date, end_date) -> list[dict]:
             FROM {TABLE_ID}
             WHERE client = '{_esc(client_id)}'
               AND {_date_where(start_date, end_date)}
+              {spend_clause}
             GROUP BY cd
+            {having_clause}
             ORDER BY total_spend DESC
         """)
     except Exception:
